@@ -303,11 +303,26 @@ class QualysDADatabase:
                 csam_count INTEGER,
                 vm_host_count INTEGER,
                 vm_detection_count INTEGER,
+                csam_expected INTEGER,
+                vm_host_expected INTEGER,
+                vm_detection_expected INTEGER,
                 changes_detected INTEGER,
                 status TEXT NOT NULL,
                 error TEXT
             )
         """)
+        # Idempotent migration for existing databases
+        for coldef in [
+            "csam_expected INTEGER",
+            "vm_host_expected INTEGER",
+            "vm_detection_expected INTEGER",
+        ]:
+            col = coldef.split()[0]
+            try:
+                cursor.execute(f"ALTER TABLE refresh_log ADD COLUMN {coldef}")
+                logger.info(f"Migrated refresh_log: added {col}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
         # ── Indexes ──────────────────────────────────────────────
         indexes = [
@@ -607,14 +622,20 @@ class QualysDADatabase:
 
     def complete_refresh(self, refresh_id: int, csam: int = 0, vm_hosts: int = 0,
                          vm_detections: int = 0, changes: int = 0,
-                         status: str = "success", error: str = None):
+                         status: str = "success", error: str = None,
+                         csam_expected: Optional[int] = None,
+                         vm_host_expected: Optional[int] = None,
+                         vm_detection_expected: Optional[int] = None):
         self.conn.execute(
             """UPDATE refresh_log
                SET completed_at=?, csam_count=?, vm_host_count=?,
-                   vm_detection_count=?, changes_detected=?, status=?, error=?
+                   vm_detection_count=?, changes_detected=?, status=?, error=?,
+                   csam_expected=?, vm_host_expected=?, vm_detection_expected=?
                WHERE id=?""",
             (datetime.utcnow().isoformat(), csam, vm_hosts, vm_detections,
-             changes, status, error, refresh_id),
+             changes, status, error,
+             csam_expected, vm_host_expected, vm_detection_expected,
+             refresh_id),
         )
         self.conn.commit()
 

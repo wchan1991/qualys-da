@@ -872,10 +872,62 @@ def internal_error(e):
 # MAIN
 # ============================================================
 
+def _lan_ip() -> str:
+    """Best-effort primary LAN IP. Falls back to 127.0.0.1 if offline."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # No packet is actually sent — UDP connect() just picks the outbound
+        # interface the OS would use, which is the LAN IP we want to print.
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _parse_cli_args(argv):
+    """Parse server host/port flags. Returns (host_override, port_override, public)."""
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Qualys Data Analytics web server.",
+        epilog="Default: binds to localhost only. Use --public to expose on LAN.",
+    )
+    p.add_argument(
+        "--host",
+        help="Bind address (e.g. 127.0.0.1, 0.0.0.0, 10.0.0.5). "
+             "Overrides [server] host in config.",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        help="Listen port. Overrides [server] port in config.",
+    )
+    p.add_argument(
+        "--public",
+        action="store_true",
+        help="Shortcut for --host 0.0.0.0 (bind to all interfaces; reachable "
+             "from LAN by your machine's IP).",
+    )
+    return p.parse_args(argv)
+
+
 if __name__ == "__main__":
     logger.info("Starting Qualys Data Analytics...")
     config = get_config()
     logger.info(f"Config loaded: {config}")
+
+    args = _parse_cli_args(sys.argv[1:])
+
+    # Resolve bind host: --public > --host > config > default
+    if args.public:
+        host = "0.0.0.0"
+    elif args.host:
+        host = args.host
+    else:
+        host = config.server_host
+    port = args.port or config.server_port
 
     # Initialize scheduler
     init_scheduler()
@@ -884,9 +936,24 @@ if __name__ == "__main__":
     get_manager()
     logger.info("Database initialized")
 
+    # Print reachable URL(s) so the user knows exactly where to point a browser.
+    if host in ("0.0.0.0", "::"):
+        lan = _lan_ip()
+        logger.info("=" * 60)
+        logger.info(f"Serving on ALL interfaces (port {port}):")
+        logger.info(f"  Local:   http://localhost:{port}")
+        logger.info(f"  LAN:     http://{lan}:{port}")
+        logger.info("=" * 60)
+    else:
+        display = "localhost" if host in ("127.0.0.1", "localhost") else host
+        logger.info("=" * 60)
+        logger.info(f"Serving on http://{display}:{port}  (bound to {host})")
+        logger.info("  Use --public to expose on LAN.")
+        logger.info("=" * 60)
+
     app.run(
-        host="0.0.0.0",
-        port=5001,
+        host=host,
+        port=port,
         debug=True,
         use_reloader=False  # Avoid double scheduler init
     )

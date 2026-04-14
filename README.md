@@ -79,11 +79,31 @@ python cli.py refresh      # pull real data from Qualys
 # Or load demo data (120 hosts, ~2,700 detections, 52 weeks of rollups):
 python seed_data.py --reset
 
-python app.py              # launches on http://localhost:5000
+python app.py              # launches on http://localhost:5001
 ```
 
-Open **http://localhost:5000** — the Dashboard should populate with metric
+Open **http://localhost:5001** — the Dashboard should populate with metric
 cards, KPI cards, and charts.
+
+By default the server binds to **localhost only**. To reach the dashboard
+from another machine on your LAN (e.g. share it with a teammate), either:
+
+```bash
+python app.py --public                 # bind to all interfaces
+python app.py --host 10.0.0.5          # bind to a specific machine IP
+python app.py --port 8080              # change port
+```
+
+…or set them permanently in `config/.config`:
+
+```ini
+[server]
+host = 0.0.0.0    # or a specific IP; default is localhost
+port = 5001
+```
+
+On startup the log prints the exact URL(s) the server is reachable at,
+including your machine's LAN IP when bound publicly.
 
 ## Using the SQL tab with pandas
 
@@ -232,6 +252,18 @@ qualys-da/
 ├── static/                # style.css + app.js
 └── tests/                 # unittest QA suite
 ```
+
+## Dashboard formulas
+
+Every number shown on the dashboard, 6-Pack, KPIs, Tags, Trends, and Ownership
+pages is computed by a method on `AnalyticsEngine` (`src/analytics.py`). The
+full reference — including the SQL each method runs and the formulas derived
+from the results — lives in [`docs/FORMULAS.md`](docs/FORMULAS.md).
+
+The reference is kept honest by
+`tests/test_formulas_doc.py::test_every_analytics_method_is_documented`, which
+fails whenever a new public method is added to `AnalyticsEngine` without a
+matching entry in the doc. It runs as part of the standard suite (see below).
 
 ## Running tests
 

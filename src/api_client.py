@@ -10,10 +10,11 @@ Includes rate limiting, pagination, retry, and XML/JSON parsing.
 
 import time
 import logging
+import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -44,29 +45,41 @@ class RateLimitError(QualysError):
 
 @dataclass
 class RateLimiter:
-    """Token bucket rate limiter."""
+    """Token bucket rate limiter. Thread-safe: `acquire()` is guarded by a lock
+    so parallel VM + CSAM fetches cannot race on `_tokens` / `_last_update`."""
     calls_per_minute: int
     burst_limit: int = 10
     _tokens: float = None
     _last_update: float = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self):
         self._tokens = float(self.burst_limit)
         self._last_update = time.time()
 
     def acquire(self) -> float:
-        now = time.time()
-        elapsed = now - self._last_update
-        refill_rate = self.calls_per_minute / 60.0
-        self._tokens = min(self.burst_limit, self._tokens + elapsed * refill_rate)
-        self._last_update = now
-        if self._tokens >= 1:
-            self._tokens -= 1
-            return 0.0
-        wait_time = (1 - self._tokens) / refill_rate
+        """Acquire a token, blocking if the bucket is empty.
+
+        Thread-safe: the critical section (refill + reserve) runs under the
+        lock, but the sleep happens *after* releasing the lock so parallel
+        callers don't serialize on each other's wait — they each reserve a
+        future slot (by advancing `_last_update`) and then sleep in parallel.
+        """
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_update
+            refill_rate = self.calls_per_minute / 60.0
+            self._tokens = min(self.burst_limit, self._tokens + elapsed * refill_rate)
+            self._last_update = now
+            if self._tokens >= 1:
+                self._tokens -= 1
+                return 0.0
+            wait_time = (1 - self._tokens) / refill_rate
+            self._tokens = 0
+            # Reserve this caller's future slot so the next acquirer sees the
+            # bucket as "empty until after our wait" — prevents thundering herd.
+            self._last_update = now + wait_time
         time.sleep(wait_time)
-        self._tokens = 0
-        self._last_update = time.time()
         return wait_time
 
 
@@ -282,6 +295,60 @@ class QualysClient:
         except requests.RequestException as e:
             raise AuthError(f"CSAM authentication request failed: {e}")
 
+    def _csam_apply_server_throttle(self, response: requests.Response) -> None:
+        """Honour Qualys CSAM's own rate-limit / concurrency headers.
+
+        When pulling large tenants (e.g. ~104k assets → ~100+ pages), the
+        shared client-side token bucket is not enough — Qualys enforces its
+        own per-API-key budget and a concurrency cap, and reports both via
+        response headers on every CSAM call:
+
+            X-RateLimit-Limit           per-window call budget
+            X-RateLimit-Remaining       calls left in the current window
+            X-RateLimit-ToWait-Sec      seconds until the window resets (if 0/low)
+            X-Concurrency-Limit-Limit   max concurrent requests
+            X-Concurrency-Limit-Running current concurrent requests
+
+        Strategy: if Remaining is low OR ToWait-Sec is positive, sleep for
+        the server-reported wait. If concurrency is saturated, back off for
+        a small fixed window. This keeps big CSAM pulls from tripping 429s
+        mid-pagination.
+        """
+        def _int_header(name):
+            try:
+                v = response.headers.get(name)
+                return int(v) if v is not None and v.strip() != "" else None
+            except (ValueError, AttributeError):
+                return None
+
+        remaining = _int_header("X-RateLimit-Remaining")
+        to_wait = _int_header("X-RateLimit-ToWait-Sec")
+        conc_limit = _int_header("X-Concurrency-Limit-Limit")
+        conc_running = _int_header("X-Concurrency-Limit-Running")
+
+        sleep_for = 0.0
+        reason = None
+
+        # Qualys returns ToWait-Sec > 0 when we're throttled *right now*.
+        if to_wait is not None and to_wait > 0:
+            sleep_for = float(to_wait)
+            reason = f"server asked us to wait {to_wait}s (X-RateLimit-ToWait-Sec)"
+        # If we're within 2 calls of the budget, burn a small delay so the
+        # next page doesn't push us over.
+        elif remaining is not None and remaining <= 2:
+            sleep_for = 2.0
+            reason = f"rate budget almost exhausted (Remaining={remaining})"
+        # Concurrency saturated: brief pause lets in-flight calls drain.
+        elif (conc_limit is not None and conc_running is not None
+              and conc_running >= conc_limit):
+            sleep_for = 1.0
+            reason = (f"concurrency saturated "
+                      f"({conc_running}/{conc_limit} in flight)")
+
+        if sleep_for > 0:
+            logger.info(f"CSAM throttle: sleeping {sleep_for:.1f}s — {reason}")
+            time.sleep(sleep_for)
+
     def _csam_request(self, method: str, endpoint: str,
                       json_body: Any = None, params: Dict = None,
                       timeout: int = None) -> requests.Response:
@@ -304,8 +371,38 @@ class QualysClient:
                     method=method, url=url, json=json_body, params=params,
                     timeout=timeout or self.config.timeout,
                 )
+            # Honour Qualys CSAM rate-limit / concurrency headers before the
+            # next call goes out. This is the big 104k-asset fix — without
+            # it a parallel refresh can burn through the per-key budget and
+            # start collecting 429s half-way through pagination.
+            if 200 <= response.status_code < 300:
+                self._csam_apply_server_throttle(response)
             if response.status_code == 429:
-                raise RateLimitError("CSAM API rate limit exceeded")
+                # Server explicitly said stop. Honour Retry-After (RFC 7231)
+                # or Qualys's own X-RateLimit-ToWait-Sec, then retry once.
+                retry_after = response.headers.get("Retry-After")
+                wait_hdr = response.headers.get("X-RateLimit-ToWait-Sec")
+                try:
+                    sleep_for = float(retry_after or wait_hdr or 30)
+                except (TypeError, ValueError):
+                    sleep_for = 30.0
+                sleep_for = max(1.0, min(sleep_for, 120.0))  # clamp
+                logger.warning(
+                    f"CSAM 429 — sleeping {sleep_for:.0f}s then retrying once "
+                    f"(Retry-After={retry_after!r}, "
+                    f"X-RateLimit-ToWait-Sec={wait_hdr!r})"
+                )
+                time.sleep(sleep_for)
+                response = session.request(
+                    method=method, url=url, json=json_body, params=params,
+                    timeout=timeout or self.config.timeout,
+                )
+                if response.status_code == 429:
+                    raise RateLimitError(
+                        "CSAM API rate limit exceeded — still 429 after retry"
+                    )
+                if 200 <= response.status_code < 300:
+                    self._csam_apply_server_throttle(response)
             if response.status_code >= 500:
                 raise QualysError(
                     f"CSAM API server error: {response.status_code}",
@@ -330,6 +427,94 @@ class QualysClient:
         except (QualysError, Exception) as e:
             result["csam_error"] = str(e)
         return result
+
+    # ── Preflight Auth ───────────────────────────────────────────
+
+    def ensure_authenticated(self) -> None:
+        """Eagerly authenticate to both APIs. Raises AuthError if either fails.
+
+        Call this at the start of a refresh so credential / connectivity
+        problems surface in ~1–2 seconds instead of deep inside a partial pull
+        (after CSAM/VM have already written thousands of rows to the DB).
+
+        Both `_vm_authenticate()` and `_csam_authenticate()` no-op when a
+        valid token/session is still cached, so calling this at the top of
+        every refresh is cheap after the first run.
+        """
+        logger.info("Preflight: verifying Qualys auth (VM + CSAM)...")
+        self._vm_authenticate()      # raises AuthError on failure
+        self._csam_authenticate()    # raises AuthError on failure
+        logger.info("Preflight OK — VM and CSAM both authenticated")
+
+    # ── Expected-Count Preflight Helpers ─────────────────────────
+
+    def count_vm_hosts(self) -> Optional[int]:
+        """POST /api/3.0/fo/asset/host/?action=count — returns a single TOTAL.
+        Returns None (non-fatal) if the count endpoint is unavailable."""
+        try:
+            resp = self._vm_request(
+                "POST",
+                "/api/3.0/fo/asset/host/",
+                data={"action": "count"},
+                timeout=30,
+            )
+            root = ET.fromstring(resp.text)
+            # Qualys returns the figure in one of these elements depending on
+            # platform / API revision.
+            for tag in ("TOTAL", "COUNT", "TOTAL_HOSTS"):
+                val = root.findtext(f".//{tag}")
+                if val and val.strip().isdigit():
+                    return int(val.strip())
+            return None
+        except Exception as e:
+            logger.warning(f"VM host count preflight failed (non-fatal): {e}")
+            return None
+
+    def count_vm_detections(self) -> Optional[int]:
+        """POST /api/5.0/fo/asset/host/vm/detection/?action=count.
+        Returns None (non-fatal) on error."""
+        try:
+            resp = self._vm_request(
+                "POST",
+                "/api/5.0/fo/asset/host/vm/detection/",
+                data={"action": "count"},
+                timeout=60,
+            )
+            root = ET.fromstring(resp.text)
+            for tag in ("TOTAL_HOST_DETECTIONS", "TOTAL_DETECTIONS", "TOTAL", "COUNT"):
+                val = root.findtext(f".//{tag}")
+                if val and val.strip().isdigit():
+                    return int(val.strip())
+            return None
+        except Exception as e:
+            logger.warning(f"VM detection count preflight failed (non-fatal): {e}")
+            return None
+
+    def count_csam_assets(self) -> Optional[int]:
+        """POST /rest/2.0/count/am/asset — returns a single count field.
+        Returns None (non-fatal) on error."""
+        try:
+            resp = self._csam_request(
+                "POST",
+                "/rest/2.0/count/am/asset",
+                json_body={},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            rd = data.get("ServiceResponse", data)
+            for key in ("count", "totalRecords", "total"):
+                val = rd.get(key)
+                if val is not None:
+                    try:
+                        return int(val)
+                    except (TypeError, ValueError):
+                        continue
+            return None
+        except Exception as e:
+            logger.warning(f"CSAM count preflight failed (non-fatal): {e}")
+            return None
 
     # ── XML Parsing Helpers ──────────────────────────────────────
 
@@ -370,9 +555,17 @@ class QualysClient:
 
     # ── Fetch VM Hosts ───────────────────────────────────────────
 
-    def fetch_vm_hosts(self, max_pages: int = 500) -> List[Dict]:
-        """Fetch all hosts from VM Host List API v3."""
-        logger.info("Fetching VM hosts...")
+    def fetch_vm_hosts(self, max_pages: int = 500,
+                       expected: Optional[int] = None) -> List[Dict]:
+        """Fetch all hosts from VM Host List API v3.
+
+        If `expected` is given (from count_vm_hosts()), logs it upfront and
+        warns if the fetched total drifts (catches silent truncation on
+        max_pages, rate-limit 429s, partial pagination, etc.)."""
+        if expected is not None:
+            logger.info(f"Fetching VM hosts... (expected: {expected:,})")
+        else:
+            logger.info("Fetching VM hosts...")
         all_hosts = []
         page = 0
 
@@ -395,7 +588,15 @@ class QualysClient:
             all_hosts.extend(hosts)
 
             if page % 10 == 0:
-                logger.info(f"  VM hosts: fetched {len(all_hosts)} so far (page {page})")
+                if expected:
+                    logger.info(
+                        f"  VM hosts: fetched {len(all_hosts):,} of {expected:,} "
+                        f"(page {page})"
+                    )
+                else:
+                    logger.info(
+                        f"  VM hosts: fetched {len(all_hosts)} so far (page {page})"
+                    )
 
             next_url = self._get_pagination_url(response.text)
             if not next_url:
@@ -410,6 +611,11 @@ class QualysClient:
                 logger.error(f"VM host pagination failed: {e}")
                 break
 
+        if expected is not None and len(all_hosts) != expected:
+            logger.warning(
+                f"VM hosts: fetched {len(all_hosts):,} but count endpoint "
+                f"reported {expected:,} (drift of {len(all_hosts) - expected:+,})"
+            )
         logger.info(f"Fetched {len(all_hosts)} VM hosts total")
         return all_hosts
 
@@ -446,9 +652,16 @@ class QualysClient:
 
     # ── Fetch VM Detections ──────────────────────────────────────
 
-    def fetch_vm_detections(self, max_pages: int = 500) -> List[Dict]:
-        """Fetch all host detections from VM Detection API v5."""
-        logger.info("Fetching VM detections...")
+    def fetch_vm_detections(self, max_pages: int = 500,
+                            expected: Optional[int] = None) -> List[Dict]:
+        """Fetch all host detections from VM Detection API v5.
+
+        If `expected` is given (from count_vm_detections()), logs it upfront
+        and warns if the fetched total drifts."""
+        if expected is not None:
+            logger.info(f"Fetching VM detections... (expected: {expected:,})")
+        else:
+            logger.info("Fetching VM detections...")
         all_detections = []
         page = 0
 
@@ -471,7 +684,16 @@ class QualysClient:
             all_detections.extend(detections)
 
             if page % 10 == 0:
-                logger.info(f"  VM detections: fetched {len(all_detections)} so far (page {page})")
+                if expected:
+                    logger.info(
+                        f"  VM detections: fetched {len(all_detections):,} of "
+                        f"{expected:,} (page {page})"
+                    )
+                else:
+                    logger.info(
+                        f"  VM detections: fetched {len(all_detections)} so far "
+                        f"(page {page})"
+                    )
 
             next_url = self._get_pagination_url(response.text)
             if not next_url:
@@ -486,6 +708,12 @@ class QualysClient:
                 logger.error(f"VM detection pagination failed: {e}")
                 break
 
+        if expected is not None and len(all_detections) != expected:
+            logger.warning(
+                f"VM detections: fetched {len(all_detections):,} but count "
+                f"endpoint reported {expected:,} "
+                f"(drift of {len(all_detections) - expected:+,})"
+            )
         logger.info(f"Fetched {len(all_detections)} VM detections total")
         return all_detections
 
@@ -542,9 +770,31 @@ class QualysClient:
 
     # ── Fetch CSAM Assets ────────────────────────────────────────
 
-    def fetch_csam_assets(self, max_pages: int = 500) -> List[Dict]:
-        """Fetch all assets from CSAM Asset Host Data API."""
-        logger.info("Fetching CSAM assets...")
+    def fetch_csam_assets(self, max_pages: int = 500,
+                          expected: Optional[int] = None,
+                          page_size: Optional[int] = None) -> List[Dict]:
+        """Fetch all assets from CSAM Asset Host Data API.
+
+        If `expected` is given (from count_csam_assets()), logs it upfront
+        and warns if the fetched total drifts.
+
+        `page_size` defaults to `config.csam_page_size` (1000). Bumping
+        from the old 300 cuts a 104k-asset pull from ~347 calls to ~104.
+        The CSAM API supports up to 1000 per request; lower if a tenant
+        throttles aggressively.
+        """
+        if page_size is None:
+            page_size = getattr(self.config, "csam_page_size", 1000)
+        # Qualys CSAM search accepts up to 1000; cap defensively.
+        page_size = max(1, min(int(page_size), 1000))
+
+        if expected is not None:
+            logger.info(
+                f"Fetching CSAM assets... (expected: {expected:,}, "
+                f"page_size: {page_size})"
+            )
+        else:
+            logger.info(f"Fetching CSAM assets... (page_size: {page_size})")
         all_assets = []
         last_seen_id = None
         page = 0
@@ -554,7 +804,7 @@ class QualysClient:
             body = {
                 "ServiceRequest": {
                     "preferences": {
-                        "limitResults": 300,
+                        "limitResults": page_size,
                     }
                 }
             }
@@ -595,7 +845,16 @@ class QualysClient:
             all_assets.extend(assets)
 
             if page % 10 == 0:
-                logger.info(f"  CSAM assets: fetched {len(all_assets)} so far (page {page})")
+                if expected:
+                    logger.info(
+                        f"  CSAM assets: fetched {len(all_assets):,} of "
+                        f"{expected:,} (page {page})"
+                    )
+                else:
+                    logger.info(
+                        f"  CSAM assets: fetched {len(all_assets)} so far "
+                        f"(page {page})"
+                    )
 
             has_more = resp_data.get("hasMoreRecords", resp_data.get("hasMore", False))
             last_seen_id = resp_data.get("lastSeenAssetId", resp_data.get("lastId"))
@@ -603,6 +862,11 @@ class QualysClient:
             if not has_more or not last_seen_id:
                 break
 
+        if expected is not None and len(all_assets) != expected:
+            logger.warning(
+                f"CSAM assets: fetched {len(all_assets):,} but count endpoint "
+                f"reported {expected:,} (drift of {len(all_assets) - expected:+,})"
+            )
         logger.info(f"Fetched {len(all_assets)} CSAM assets total")
         return all_assets
 

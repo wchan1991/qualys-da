@@ -30,6 +30,12 @@ vm_base_url = https://qualysapi.qualys.eu
 csam_base_url = https://gateway.qg1.apps.qualys.eu
 timeout = 60
 max_retries = 3
+# Pull VM (hosts+detections) and CSAM in parallel. ~40-50% faster wall-clock.
+# Set to false if your tenant's rate limits trip 429s under parallel load.
+parallel_refresh = true
+# CSAM page size (max 1000). Larger = fewer API calls but bigger responses.
+# At 104k assets: 1000→104 calls, 300→347 calls.
+csam_page_size = 1000
 
 [rate_limit]
 calls_per_minute = 60
@@ -69,6 +75,16 @@ severity_1 = 365
 enabled = true
 refresh_day = monday
 refresh_hour = 6
+
+[server]
+# Flask bind address and port.
+#   localhost / 127.0.0.1  → only this machine (default, most secure)
+#   0.0.0.0                → all interfaces (reachable from LAN by your
+#                            machine's IP — see startup log for the URL)
+#   <specific IP>          → bind that one interface
+# CLI flags override: python app.py --public | --host 10.0.0.5 | --port 5002
+host = localhost
+port = 5001
 
 [logging]
 level = INFO

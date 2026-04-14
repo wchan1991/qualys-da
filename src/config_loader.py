@@ -35,6 +35,11 @@ class QualysDAConfig:
     rate_limit_enabled: bool = True
     calls_per_minute: int = 60
 
+    # Refresh
+    parallel_refresh: bool = True   # Pull VM and CSAM in parallel (~40-50% faster)
+    csam_page_size: int = 1000      # Assets per CSAM call (max 1000). 104k assets
+                                    # → 104 calls at 1000, vs 347 calls at 300.
+
     # Database
     db_path: str = "data/qualys_da.db"
 
@@ -62,6 +67,10 @@ class QualysDAConfig:
     scheduler_enabled: bool = True
     refresh_day: str = "monday"
     refresh_hour: int = 6
+
+    # Server (Flask bind host + port)
+    server_host: str = "localhost"
+    server_port: int = 5001
 
     # Logging
     log_level: str = "INFO"
@@ -185,6 +194,8 @@ def load_config(config_path: Optional[Path] = None) -> QualysDAConfig:
         password=get_str("credentials", "password", ""),
         rate_limit_enabled=get_bool("rate_limit", "enabled", True),
         calls_per_minute=get_int("rate_limit", "calls_per_minute", 60),
+        parallel_refresh=get_bool("api", "parallel_refresh", True),
+        csam_page_size=get_int("api", "csam_page_size", 1000),
         db_path=get_str("database", "db_path", "data/qualys_da.db"),
         daily_retention_days=get_int("retention", "daily_retention_days", 30),
         weekly_retention_weeks=get_int("retention", "weekly_retention_weeks", 52),
@@ -199,6 +210,8 @@ def load_config(config_path: Optional[Path] = None) -> QualysDAConfig:
         scheduler_enabled=get_bool("scheduler", "enabled", True),
         refresh_day=get_str("scheduler", "refresh_day", "monday"),
         refresh_hour=get_int("scheduler", "refresh_hour", 6),
+        server_host=get_str("server", "host", "localhost"),
+        server_port=get_int("server", "port", 5001),
         log_level=get_str("logging", "level", "INFO"),
     )
 
@@ -209,6 +222,8 @@ def load_config(config_path: Optional[Path] = None) -> QualysDAConfig:
         "QUALYS_DA_VM_URL": ("vm_base_url", str),
         "QUALYS_DA_CSAM_URL": ("csam_base_url", str),
         "QUALYS_DA_TIMEOUT": ("timeout", int),
+        "QUALYS_DA_HOST": ("server_host", str),
+        "QUALYS_DA_PORT": ("server_port", int),
     }
 
     for env_var, (attr, converter) in env_map.items():

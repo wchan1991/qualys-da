@@ -136,9 +136,25 @@ def cmd_status(args, manager):
     refresh_log = manager.db.get_refresh_log(5)
     if refresh_log:
         print("\nRecent Refreshes:")
+
+        def _fmt_pair(actual, expected):
+            """Render 'actual/expected' with a * marker if there's drift."""
+            actual = actual or 0
+            if expected is None:
+                return f"{actual:,}"
+            mark = "" if actual == expected else "*"
+            return f"{actual:,}/{expected:,}{mark}"
+
         for entry in refresh_log:
-            print(f"  {entry.get('started_at', '?')} | {entry.get('source', '?')} | {entry.get('status', '?')} | "
-                  f"CSAM:{entry.get('csam_count', 0)} VM-H:{entry.get('vm_host_count', 0)} VM-D:{entry.get('vm_detection_count', 0)}")
+            print(
+                f"  {entry.get('started_at', '?')} | "
+                f"{entry.get('source', '?')} | "
+                f"{entry.get('status', '?')} | "
+                f"CSAM:{_fmt_pair(entry.get('csam_count'), entry.get('csam_expected'))} "
+                f"VM-H:{_fmt_pair(entry.get('vm_host_count'), entry.get('vm_host_expected'))} "
+                f"VM-D:{_fmt_pair(entry.get('vm_detection_count'), entry.get('vm_detection_expected'))}"
+            )
+        print("  (* = fetched count differs from Qualys count-endpoint preflight)")
     else:
         print("\nNo refresh history yet.")
     return 0

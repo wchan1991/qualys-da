@@ -10,12 +10,13 @@ Coordinator singleton that orchestrates:
 import csv
 import io
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 from .config_loader import QualysDAConfig
 from .database import QualysDADatabase
-from .api_client import QualysClient, QualysError
+from .api_client import QualysClient, QualysError, AuthError
 from .analytics import AnalyticsEngine
 
 logger = logging.getLogger(__name__)
@@ -54,21 +55,85 @@ class DataManager:
     # ── Refresh ──────────────────────────────────────────────────
 
     def refresh_all(self) -> Dict[str, Any]:
-        """Full refresh: fetch all 3 APIs, diff, save, compute rollups, purge."""
+        """Full refresh with three upgrades over the old sequential path:
+
+        1. **Preflight auth** — verifies VM + CSAM credentials before any DB
+           writes, so bad creds / firewall blocks fail in ~1–2 seconds
+           instead of deep inside a partial pull.
+        2. **Expected counts** — queries Qualys count endpoints upfront so
+           the log shows "N assets expected" before pagination starts. The
+           operator can tell instantly whether the refresh is small or huge.
+        3. **Parallel pull** — CSAM on one thread, VM (hosts→detections) on
+           another. Wall-clock roughly halves on typical tenants. Gated by
+           `config.parallel_refresh` (set false to revert to sequential).
+           The rate-limiter is now thread-safe (see api_client.RateLimiter).
+        """
         refresh_id = self.db.log_refresh("all")
         now = datetime.utcnow().isoformat()
         counts = {"csam": 0, "vm_hosts": 0, "vm_detections": 0, "changes": 0}
 
         try:
-            # Get previous detection state for diffing
+            logger.info("=" * 60)
+            logger.info("Starting full refresh")
+            logger.info("=" * 60)
+
+            # ── 1. Preflight auth: fail fast on bad creds ────────────
+            try:
+                self.client.ensure_authenticated()
+            except AuthError as e:
+                logger.error(f"Refresh aborted — auth failed: {e}")
+                self.db.complete_refresh(
+                    refresh_id, status="failed", error=f"auth: {e}"
+                )
+                raise
+
+            # ── 2. Preflight counts (non-fatal if endpoint unavailable) ──
+            csam_expected = self.client.count_csam_assets()
+            vm_host_expected = self.client.count_vm_hosts()
+            vm_det_expected = self.client.count_vm_detections()
+
+            def _fmt(n):
+                return f"{n:,}" if n is not None else "unknown"
+
+            logger.info(
+                f"Expected volumes — CSAM assets: {_fmt(csam_expected)} · "
+                f"VM hosts: {_fmt(vm_host_expected)} · "
+                f"VM detections: {_fmt(vm_det_expected)}"
+            )
+
+            # Snapshot previous detection state for diffing (before new data lands)
             old_detections = self.db.get_previous_detections()
 
-            # Fetch from all APIs
-            csam_assets = self.client.fetch_csam_assets()
-            vm_hosts = self.client.fetch_vm_hosts()
-            vm_detections = self.client.fetch_vm_detections()
+            # ── 3. Fetch: parallel (default) or sequential (config opt-out) ──
+            if self.config.parallel_refresh:
+                logger.info("Fetching CSAM and VM in parallel...")
 
-            # Save data
+                def _csam_thread():
+                    return self.client.fetch_csam_assets(expected=csam_expected)
+
+                def _vm_thread():
+                    # Hosts + detections share the VM session's auth cookie and
+                    # the VM rate-limit bucket, so keep them sequential *inside*
+                    # this thread — parallelizing them offers little speedup
+                    # and risks tripping the VM rate limit.
+                    hosts = self.client.fetch_vm_hosts(expected=vm_host_expected)
+                    dets = self.client.fetch_vm_detections(expected=vm_det_expected)
+                    return hosts, dets
+
+                with ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="refresh"
+                ) as pool:
+                    csam_future = pool.submit(_csam_thread)
+                    vm_future = pool.submit(_vm_thread)
+                    csam_assets = csam_future.result()
+                    vm_hosts, vm_detections = vm_future.result()
+            else:
+                logger.info("Fetching sequentially (parallel_refresh=false)...")
+                csam_assets = self.client.fetch_csam_assets(expected=csam_expected)
+                vm_hosts = self.client.fetch_vm_hosts(expected=vm_host_expected)
+                vm_detections = self.client.fetch_vm_detections(expected=vm_det_expected)
+
+            # ── 4. DB writes (single-threaded) ───────────────────────
             counts["csam"] = self.db.save_csam_assets(csam_assets, now)
             counts["vm_hosts"] = self.db.save_vm_hosts(vm_hosts, now)
             counts["vm_detections"] = self.db.save_vm_detections(vm_detections, now)
@@ -94,9 +159,18 @@ class DataManager:
             # GFS retention
             self.analytics.purge_snapshots()
 
-            self.db.complete_refresh(refresh_id, **counts)
+            self.db.complete_refresh(
+                refresh_id,
+                csam_expected=csam_expected,
+                vm_host_expected=vm_host_expected,
+                vm_detection_expected=vm_det_expected,
+                **counts,
+            )
             logger.info(f"Refresh complete: {counts}")
 
+        except AuthError:
+            # Already logged + marked failed above; don't double-log.
+            raise
         except Exception as e:
             logger.exception(f"Refresh failed: {e}")
             self.db.complete_refresh(refresh_id, status="failed", error=str(e))
