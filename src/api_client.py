@@ -215,6 +215,16 @@ class QualysClient:
         return self._csam_session
 
     def _csam_authenticate(self) -> None:
+        """Authenticate with the Qualys Gateway and obtain a JWT.
+
+        Qualys Gateway auth (`POST /auth`) is **form-encoded** and returns the
+        JWT as a **plain-text** response body — not JSON. Sending a JSON body
+        with `Content-Type: application/json` causes the gateway to return
+        HTTP 500. The required form fields are `username`, `password`, and
+        `token=true` (some platforms also accept `permissions=true`).
+
+        Reference: Qualys Platform API — Gateway Service authentication.
+        """
         if self._csam_token and self._csam_token_expires:
             if datetime.now() < self._csam_token_expires:
                 return
@@ -224,28 +234,51 @@ class QualysClient:
         url = f"{self.config.csam_base_url}/auth"
 
         try:
+            # Override the session's default JSON Content-Type for this one call;
+            # the gateway requires form encoding. `data=` makes requests set
+            # `Content-Type: application/x-www-form-urlencoded` automatically.
             response = session.post(
                 url,
-                json={
+                data={
                     "username": self.config.username,
                     "password": self.config.password,
+                    "token": "true",
+                    "permissions": "true",
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "text/plain",
                 },
                 timeout=self.config.timeout,
             )
-            if response.status_code == 200:
-                data = response.json()
-                self._csam_token = data.get("token", data.get("access_token", ""))
-                if not self._csam_token:
-                    # Some CSAM endpoints return token in Authorization header
-                    self._csam_token = response.headers.get("Authorization", "").replace("Bearer ", "")
-                if self._csam_token:
-                    self._csam_token_expires = datetime.now() + timedelta(hours=4)
-                    session.headers["Authorization"] = f"Bearer {self._csam_token}"
-                    logger.info("CSAM authentication successful")
-                else:
-                    raise AuthError("CSAM auth: no token in response")
+            if response.status_code == 201 or response.status_code == 200:
+                # Gateway returns the raw JWT in the response body (plain text).
+                token = (response.text or "").strip()
+                if not token:
+                    # Fallback for older platforms that return JSON
+                    try:
+                        data = response.json()
+                        token = data.get("token") or data.get("access_token") or ""
+                    except ValueError:
+                        token = ""
+                if not token:
+                    # Last-ditch: some deployments send the token in a header
+                    token = response.headers.get("Authorization", "").replace("Bearer ", "").strip()
+                if not token:
+                    raise AuthError("CSAM auth: empty token in response body")
+
+                self._csam_token = token
+                self._csam_token_expires = datetime.now() + timedelta(hours=4)
+                session.headers["Authorization"] = f"Bearer {self._csam_token}"
+                logger.info("CSAM authentication successful")
             else:
-                raise AuthError(f"CSAM authentication failed: HTTP {response.status_code}")
+                # Surface the response body so the failure can be diagnosed —
+                # a bare HTTP code rarely tells you why the gateway rejected you.
+                body = (response.text or "")[:400].replace("\n", " ")
+                raise AuthError(
+                    f"CSAM authentication failed: HTTP {response.status_code} "
+                    f"(url={url}) body={body!r}"
+                )
         except requests.RequestException as e:
             raise AuthError(f"CSAM authentication request failed: {e}")
 
