@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}Settings - Qualys DA{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Settings</h1>
+</div>
+
+<!-- Data Refresh -->
+<div class="card">
+    <div class="card-header">Data Refresh</div>
+    <p style="color:var(--text-secondary);margin-bottom:12px;">
+        Pull the latest data from Qualys (CSAM assets, VM hosts, VM detections).
+        Scheduled refresh runs automatically per your <code>config/.config</code> schedule.
+    </p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <button id="refresh-all-btn" class="btn btn-primary" onclick="triggerRefresh('all')">Refresh All</button>
+        <button class="btn" onclick="triggerRefresh('csam')">Refresh CSAM</button>
+        <button class="btn" onclick="triggerRefresh('vm-hosts')">Refresh VM Hosts</button>
+        <button class="btn" onclick="triggerRefresh('vm-detections')">Refresh VM Detections</button>
+        <span id="last-refresh" class="metric-label" style="margin-left:12px;"></span>
+    </div>
+</div>
+
+<!-- Default Dashboard View -->
+<div class="card">
+    <div class="card-header">Default Dashboard View</div>
+    <p style="color:var(--text-secondary);margin-bottom:12px;">
+        Controls the default time window applied when clicking through dashboard cards into the Query Builder.
+        Weekly = last 7 days, Monthly = last 30 days, Yearly = last 365 days.
+    </p>
+    <div class="pill-group">
+        <label class="pill"><input type="radio" name="default-view" value="weekly"> Weekly</label>
+        <label class="pill"><input type="radio" name="default-view" value="monthly"> Monthly</label>
+        <label class="pill"><input type="radio" name="default-view" value="yearly"> Yearly</label>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--text-muted);">
+        Saved locally in this browser. Current: <span id="current-view">—</span>
+    </div>
+</div>
+
+<!-- Recent Refresh History -->
+<div class="card">
+    <div class="card-header">Recent Refresh History</div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Started</th>
+                    <th>Completed</th>
+                    <th>Source</th>
+                    <th>Status</th>
+                    <th>CSAM</th>
+                    <th>Hosts</th>
+                    <th>Detections</th>
+                </tr>
+            </thead>
+            <tbody id="refresh-log-body">
+                <tr><td colspan="7" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Default-view preference — read/write localStorage
+function getDefaultView() { return localStorage.getItem('qda_default_view') || 'monthly'; }
+function setDefaultView(v) {
+    localStorage.setItem('qda_default_view', v);
+    document.getElementById('current-view').textContent = v;
+    showToast('Default view set to ' + v, 'success');
+}
+
+(function initView() {
+    const cur = getDefaultView();
+    document.getElementById('current-view').textContent = cur;
+    const input = document.querySelector(`input[name="default-view"][value="${cur}"]`);
+    if (input) input.checked = true;
+    document.querySelectorAll('input[name="default-view"]').forEach(el =>
+        el.addEventListener('change', e => setDefaultView(e.target.value))
+    );
+})();
+
+async function triggerRefresh(source) {
+    const btn = document.getElementById('refresh-all-btn');
+    const url = source === 'all' ? '/api/refresh' : '/api/refresh/' + source;
+    showToast('Refresh started (' + source + ')…', 'success');
+    try {
+        await fetchApi(url, { method: 'POST' });
+        showToast('Refresh dispatched', 'success');
+        setTimeout(loadRefreshLog, 1200);
+    } catch (e) {
+        showToast('Refresh failed: ' + e.message, 'error');
+    }
+}
+
+async function loadRefreshLog() {
+    const data = await fetchApi('/api/refresh-log');
+    const tbody = document.getElementById('refresh-log-body');
+    if (!data || !data.length) {
+        tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);padding:20px;text-align:center;">No refreshes recorded yet</td></tr>';
+        return;
+    }
+    tbody.innerHTML = data.slice(0, 15).map(r => {
+        const cls = r.status === 'success' ? 'badge-low' : r.status === 'failed' ? 'badge-critical' : 'badge-info';
+        return `<tr>
+            <td>${(r.started_at || '').slice(0, 16)}</td>
+            <td>${(r.completed_at || '').slice(0, 16)}</td>
+            <td>${r.source || ''}</td>
+            <td><span class="badge ${cls}">${r.status || ''}</span></td>
+            <td>${(r.csam_count || 0).toLocaleString()}</td>
+            <td>${(r.vm_host_count || 0).toLocaleString()}</td>
+            <td>${(r.vm_detection_count || 0).toLocaleString()}</td>
+        </tr>`;
+    }).join('');
+    if (data[0] && data[0].completed_at) {
+        document.getElementById('last-refresh').textContent = 'Last: ' + data[0].completed_at.slice(0, 16);
+    }
+}
+
+loadRefreshLog();
+</script>
+{% endblock %}

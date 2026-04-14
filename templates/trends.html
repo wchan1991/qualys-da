@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Trend Analysis - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Trend Analysis</h1>
+    <div style="display:flex;gap:8px;">
+        <select id="granularity" class="btn" onchange="loadTrends()">
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+        </select>
+        <select id="range" class="btn" onchange="loadTrends()">
+            <option value="4">4 periods</option>
+            <option value="12" selected>12 periods</option>
+            <option value="26">26 periods</option>
+            <option value="52">52 periods</option>
+        </select>
+    </div>
+</div>
+
+<!-- Week-over-week cards -->
+<div class="metrics-grid" id="wow-metrics"></div>
+
+<div class="chart-row">
+    <div class="card">
+        <div class="card-header">Total Vulnerabilities</div>
+        <div class="chart-container"><canvas id="chart-total"></canvas></div>
+    </div>
+    <div class="card">
+        <div class="card-header">New vs Fixed per Period</div>
+        <div class="chart-container"><canvas id="chart-new-fixed"></canvas></div>
+    </div>
+</div>
+
+<div class="chart-row">
+    <div class="card">
+        <div class="card-header">Critical Vulns (Sev 4+5)</div>
+        <div class="chart-container"><canvas id="chart-critical"></canvas></div>
+    </div>
+    <div class="card">
+        <div class="card-header">Average TruRisk Score</div>
+        <div class="chart-container"><canvas id="chart-trurisk"></canvas></div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Host Count Over Time</div>
+    <div class="chart-container"><canvas id="chart-hosts"></canvas></div>
+</div>
+
+<div class="card" style="margin-top:16px;">
+    <div class="card-header">Recent Changes (Last 7 Days)</div>
+    <div class="metrics-grid" id="changes-grid"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let charts = {};
+
+async function loadTrends() {
+    const gran = document.getElementById('granularity').value;
+    const range = document.getElementById('range').value;
+    const endpoint = gran === 'monthly' ? '/api/metrics/trends/monthly?months=' : '/api/metrics/trends/weekly?weeks=';
+    const data = await fetchApi(endpoint + range);
+    if (!data || !data.length) return;
+
+    const labels = data.map(d => d.week_start || d.month_start || '');
+
+    function renderLine(id, datasets, title) {
+        if (charts[id]) charts[id].destroy();
+        charts[id] = new Chart(document.getElementById(id), {
+            type: 'line',
+            data: { labels, datasets },
+            options: { responsive: true, plugins: {legend:{position:'bottom'}}, scales: {y:{beginAtZero:true}}, elements:{line:{tension:0.3}} }
+        });
+    }
+
+    renderLine('chart-total', [
+        {label: 'Total Vulns', data: data.map(d=>d.total_vulns||0), borderColor: '#3b82f6', fill: false}
+    ]);
+
+    renderLine('chart-new-fixed', [
+        {label: 'New', data: data.map(d=>d.new_this_week||d.new_this_month||0), borderColor: '#ef4444', fill: false},
+        {label: 'Fixed', data: data.map(d=>d.fixed_this_week||d.fixed_this_month||0), borderColor: '#10b981', fill: false}
+    ]);
+
+    renderLine('chart-critical', [
+        {label: 'Sev 5', data: data.map(d=>d.sev5_count||0), borderColor: '#ef4444', fill: false},
+        {label: 'Sev 4', data: data.map(d=>d.sev4_count||0), borderColor: '#ea580c', fill: false}
+    ]);
+
+    renderLine('chart-trurisk', [
+        {label: 'Avg TruRisk', data: data.map(d=>d.avg_trurisk||0), borderColor: '#8b5cf6', fill: false}
+    ]);
+
+    renderLine('chart-hosts', [
+        {label: 'Total Hosts', data: data.map(d=>d.total_hosts||0), borderColor: '#3b82f6', fill: false},
+        {label: 'Both Sources', data: data.map(d=>d.both_hosts||0), borderColor: '#10b981', fill: false}
+    ]);
+
+    // Week-over-week
+    const wow = await fetchApi('/api/metrics/week-over-week');
+    if (wow && wow.deltas) {
+        const d = wow.deltas;
+        document.getElementById('wow-metrics').innerHTML = Object.entries(d).map(([key, val]) => {
+            const cls = key.includes('fixed') ? (val > 0 ? 'down' : 'up') : (val > 0 ? 'up' : val < 0 ? 'down' : 'neutral');
+            const arrow = val > 0 ? '+' : '';
+            return `<div class="metric-card"><div class="metric-value">${arrow}${val}</div><div class="metric-label">${key.replace(/_/g,' ')}</div><div class="metric-trend ${cls}">vs last week</div></div>`;
+        }).join('');
+    }
+
+    // Recent changes
+    const changes = await fetchApi('/api/metrics/changes?days=7');
+    if (changes) {
+        document.getElementById('changes-grid').innerHTML = `
+            <div class="metric-card"><div class="metric-value severity-5">${changes.new||0}</div><div class="metric-label">New (7d)</div></div>
+            <div class="metric-card"><div class="metric-value" style="color:var(--success)">${changes.fixed||0}</div><div class="metric-label">Fixed (7d)</div></div>
+            <div class="metric-card"><div class="metric-value" style="color:var(--danger)">${changes.reopened||0}</div><div class="metric-label">Reopened (7d)</div></div>
+        `;
+    }
+}
+
+loadTrends();
+</script>
+{% endblock %}

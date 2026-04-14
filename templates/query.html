@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block title %}Query Builder - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Query Builder</h1>
+    <div style="display:flex;gap:8px;">
+        <button class="btn" onclick="exportCSV()">Export CSV</button>
+        <button class="btn btn-primary" onclick="runQuery()">Search</button>
+    </div>
+</div>
+
+<div class="filter-panel">
+    <div class="filter-group">
+        <label>IP Address</label>
+        <input type="text" id="f-ip" placeholder="e.g. 10.1.0">
+    </div>
+    <div class="filter-group">
+        <label>Min Severity</label>
+        <select id="f-severity">
+            <option value="">All</option>
+            <option value="1">1+</option>
+            <option value="2">2+</option>
+            <option value="3">3+</option>
+            <option value="4">4+ (High)</option>
+            <option value="5">5 (Critical)</option>
+        </select>
+    </div>
+    <div class="filter-group">
+        <label>Status</label>
+        <div class="pill-group" id="f-status">
+            <label class="pill"><input type="checkbox" value="New" checked> New</label>
+            <label class="pill"><input type="checkbox" value="Active" checked> Active</label>
+            <label class="pill"><input type="checkbox" value="Fixed"> Fixed</label>
+            <label class="pill"><input type="checkbox" value="Re-Opened" checked> Re-Opened</label>
+        </div>
+    </div>
+    <div class="filter-group">
+        <label>QID</label>
+        <input type="number" id="f-qid" placeholder="e.g. 90001">
+    </div>
+    <div class="filter-group">
+        <label>Tag</label>
+        <select id="f-tag"><option value="">All Tags</option></select>
+    </div>
+    <div class="filter-group">
+        <label>Date From</label>
+        <input type="date" id="f-from">
+    </div>
+    <div class="filter-group">
+        <label>Date To</label>
+        <input type="date" id="f-to">
+    </div>
+    <div class="filter-group">
+        <label>Include Disabled</label>
+        <select id="f-disabled">
+            <option value="false">No</option>
+            <option value="true">Yes</option>
+        </select>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">Results <span id="result-count"></span></div>
+    <div class="table-wrapper">
+        <table class="data-table" id="results-table">
+            <thead>
+                <tr>
+                    <th onclick="sortTable(0)">IP</th>
+                    <th onclick="sortTable(1)">Host ID</th>
+                    <th onclick="sortTable(2)">QID</th>
+                    <th onclick="sortTable(3)">Severity</th>
+                    <th onclick="sortTable(4)">Status</th>
+                    <th onclick="sortTable(5)">QDS</th>
+                    <th onclick="sortTable(6)">First Found</th>
+                    <th onclick="sortTable(7)">Last Found</th>
+                </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+        </table>
+    </div>
+    <div class="pagination" id="pagination"></div>
+</div>
+
+<div class="card" style="margin-top:16px;">
+    <div class="card-header">Dynamic Chart</div>
+    <div style="display:flex;gap:12px;margin-bottom:12px;">
+        <select id="chart-type" style="padding:6px;border-radius:6px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);">
+            <option value="bar">Bar</option>
+            <option value="pie">Pie</option>
+            <option value="line">Line</option>
+        </select>
+        <select id="chart-group" style="padding:6px;border-radius:6px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);">
+            <option value="severity">Group by Severity</option>
+            <option value="status">Group by Status</option>
+            <option value="os">Group by OS</option>
+        </select>
+        <button class="btn btn-sm" onclick="generateChart()">Generate</button>
+    </div>
+    <div class="chart-container"><canvas id="dynamic-chart"></canvas></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentData = [];
+let currentPage = 1;
+const perPage = 100;
+let dynamicChart = null;
+
+async function loadTags() {
+    const tags = await fetchApi('/api/tags');
+    const sel = document.getElementById('f-tag');
+    if (tags) tags.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.tag_name;
+        opt.textContent = t.tag_name + ' (' + t.host_count + ')';
+        sel.appendChild(opt);
+    });
+}
+
+function getFilters() {
+    const status = Array.from(document.querySelectorAll('#f-status input:checked')).map(i => i.value);
+    let params = new URLSearchParams();
+    const ip = document.getElementById('f-ip').value;
+    const sev = document.getElementById('f-severity').value;
+    const qid = document.getElementById('f-qid').value;
+    const tag = document.getElementById('f-tag').value;
+    const from = document.getElementById('f-from').value;
+    const to = document.getElementById('f-to').value;
+    const disabled = document.getElementById('f-disabled').value;
+    if (ip) params.set('ip', ip);
+    if (sev) params.set('severity_min', sev);
+    status.forEach(s => params.append('status', s));
+    if (qid) params.set('qid', qid);
+    if (tag) params.set('tag', tag);
+    if (from) params.set('date_from', from);
+    if (to) params.set('date_to', to);
+    if (disabled === 'true') params.set('include_disabled', 'true');
+    params.set('page', currentPage);
+    params.set('per_page', perPage);
+    return params;
+}
+
+async function runQuery() {
+    currentPage = 1;
+    await fetchResults();
+}
+
+async function fetchResults() {
+    const params = getFilters();
+    const data = await fetchApi('/api/detections?' + params.toString());
+    if (!data) return;
+    currentData = data;
+    renderTable(data);
+}
+
+function renderTable(rows) {
+    const body = document.getElementById('results-body');
+    document.getElementById('result-count').textContent = '(' + rows.length + ' rows)';
+    body.innerHTML = rows.map(r => `<tr>
+        <td><a href="/hosts?ip=${r.ip_address}">${r.ip_address || ''}</a></td>
+        <td>${r.host_id || ''}</td>
+        <td>${r.qid || ''}</td>
+        <td class="severity-${r.severity}">${r.severity || ''}</td>
+        <td>${r.status || ''}</td>
+        <td>${r.qds || ''}</td>
+        <td>${(r.first_found || '').slice(0,10)}</td>
+        <td>${(r.last_found || '').slice(0,10)}</td>
+    </tr>`).join('');
+}
+
+function sortTable(col) {
+    const keys = ['ip_address','host_id','qid','severity','status','qds','first_found','last_found'];
+    const key = keys[col];
+    currentData.sort((a,b) => {
+        const va = a[key] || '', vb = b[key] || '';
+        return typeof va === 'number' ? vb - va : String(va).localeCompare(String(vb));
+    });
+    renderTable(currentData);
+}
+
+function exportCSV() {
+    const params = getFilters();
+    params.set('type', 'detections');
+    window.location = '/api/export/csv?' + params.toString();
+}
+
+function generateChart() {
+    const type = document.getElementById('chart-type').value;
+    const group = document.getElementById('chart-group').value;
+    const counts = {};
+    currentData.forEach(r => {
+        const key = r[group] || 'Unknown';
+        counts[key] = (counts[key] || 0) + 1;
+    });
+    const labels = Object.keys(counts);
+    const values = Object.values(counts);
+    const ctx = document.getElementById('dynamic-chart');
+    if (dynamicChart) dynamicChart.destroy();
+    dynamicChart = new Chart(ctx, {
+        type: type === 'pie' ? 'doughnut' : type,
+        data: { labels, datasets: [{ data: values, backgroundColor: labels.map((_,i) => `hsl(${i*360/labels.length},60%,55%)`), borderRadius: 4 }] },
+        options: { responsive: true, plugins: { legend: { display: type === 'pie' } } }
+    });
+}
+
+// Preload filters from URL params (so dashboard cards can deep-link here)
+function applyUrlParams() {
+    const p = new URLSearchParams(window.location.search);
+    if (!p.toString()) return;
+    const ip = p.get('ip'); if (ip) document.getElementById('f-ip').value = ip;
+    const sev = p.get('severity_min'); if (sev) document.getElementById('f-severity').value = sev;
+    const qid = p.get('qid'); if (qid) document.getElementById('f-qid').value = qid;
+    const tag = p.get('tag'); if (tag) document.getElementById('f-tag').value = tag;
+    const df = p.get('date_from'); if (df) document.getElementById('f-from').value = df;
+    const dt = p.get('date_to'); if (dt) document.getElementById('f-to').value = dt;
+    const dis = p.get('include_disabled'); if (dis) document.getElementById('f-disabled').value = dis;
+    const statuses = p.getAll('status');
+    if (statuses.length) {
+        document.querySelectorAll('#f-status input').forEach(cb => {
+            cb.checked = statuses.includes(cb.value);
+        });
+    }
+}
+
+(async function init() {
+    await loadTags();
+    applyUrlParams();
+    runQuery();
+})();
+</script>
+{% endblock %}

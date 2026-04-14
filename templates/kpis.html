@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}Operational KPIs - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Operational KPIs</h1>
+    <div style="display:flex;gap:8px;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:13px;">
+            <input type="checkbox" id="include-disabled" onchange="loadKPIs()"> Include Disabled
+        </label>
+        <button class="btn" onclick="window.location='/api/export/csv?type=kpis'">Export CSV</button>
+    </div>
+</div>
+
+<div class="metrics-grid">
+    <div class="metric-card">
+        <div class="metric-value" id="kpi-patchable-pct">--</div>
+        <div class="metric-label">% Patchable</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value" id="kpi-overall-sla">--</div>
+        <div class="metric-label">SLA Compliance</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value" id="kpi-avg-mttr">--</div>
+        <div class="metric-label">Avg MTTR (days)</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value" id="kpi-scan-cov">--</div>
+        <div class="metric-label">Scan Coverage (30d)</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value" id="kpi-fix-ratio">--</div>
+        <div class="metric-label">Fix Ratio (7d)</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-value" id="kpi-reopen">--</div>
+        <div class="metric-label">Reopen Rate</div>
+    </div>
+</div>
+
+<div class="chart-row">
+    <div class="card">
+        <div class="card-header">% Patchable</div>
+        <div class="chart-container"><canvas id="chart-patchable"></canvas></div>
+    </div>
+    <div class="card">
+        <div class="card-header">MTTR by Severity (avg days)</div>
+        <div class="chart-container"><canvas id="chart-mttr"></canvas></div>
+    </div>
+</div>
+
+<div class="chart-row">
+    <div class="card">
+        <div class="card-header">SLA Compliance by Severity</div>
+        <div class="chart-container"><canvas id="chart-sla"></canvas></div>
+    </div>
+    <div class="card">
+        <div class="card-header">Detection Age Buckets</div>
+        <div class="chart-container"><canvas id="chart-aging"></canvas></div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">SLA Configuration</div>
+    <div id="sla-config" class="filter-panel"></div>
+    <button class="btn btn-primary" onclick="saveSLA()" style="margin-top:8px;">Save SLA Targets</button>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadKPIs() {
+    const disabled = document.getElementById('include-disabled').checked;
+    const data = await fetchApi('/api/kpis?include_disabled=' + disabled);
+    if (!data) return;
+
+    setText('kpi-patchable-pct', (data.patchable?.patchable_pct || 0) + '%');
+    setText('kpi-overall-sla', (data.sla_compliance?.overall_pct || 0) + '%');
+    setText('kpi-avg-mttr', (data.detection_age?.mean_days_to_remediate || 0) + 'd');
+    setText('kpi-scan-cov', (data.scan_coverage?.scan_coverage_30d_pct || 0) + '%');
+    setText('kpi-fix-ratio', (data.detection_fix_rate?.fix_ratio || 0) + '%');
+    setText('kpi-reopen', (data.reopen_rate?.rate_pct || 0) + '%');
+
+    // Patchable doughnut
+    const p = data.patchable || {};
+    new Chart(document.getElementById('chart-patchable'), {
+        type: 'doughnut',
+        data: { labels: ['Patchable','Non-Patchable'], datasets: [{data: [p.patchable||0, p.non_patchable||0], backgroundColor: ['#10b981','#94a3b8']}] },
+        options: { responsive: true, plugins: {legend:{position:'bottom'}} }
+    });
+
+    // MTTR by severity
+    const mttr = data.mttr_by_severity || {};
+    new Chart(document.getElementById('chart-mttr'), {
+        type: 'bar',
+        data: { labels: ['Sev 1','Sev 2','Sev 3','Sev 4','Sev 5'], datasets: [{data: [mttr[1]||0, mttr[2]||0, mttr[3]||0, mttr[4]||0, mttr[5]||0], backgroundColor: ['#94a3b8','#3b82f6','#f59e0b','#ea580c','#ef4444'], borderRadius: 4}] },
+        options: { responsive: true, plugins: {legend:{display:false}}, scales: {y:{title:{display:true,text:'Days'}}} }
+    });
+
+    // SLA compliance stacked
+    const sla = data.sla_compliance?.by_severity || {};
+    const sevLabels = ['Sev 1','Sev 2','Sev 3','Sev 4','Sev 5'];
+    new Chart(document.getElementById('chart-sla'), {
+        type: 'bar',
+        data: {
+            labels: sevLabels,
+            datasets: [
+                { label: 'Compliant', data: [1,2,3,4,5].map(s => (sla[s]||{}).compliant||0), backgroundColor: '#10b981' },
+                { label: 'Breaching', data: [1,2,3,4,5].map(s => (sla[s]||{}).breaching||0), backgroundColor: '#ef4444' }
+            ]
+        },
+        options: { responsive: true, plugins: {legend:{position:'bottom'}}, scales: {x:{stacked:true},y:{stacked:true}} }
+    });
+
+    // Aging
+    const age = data.detection_age || {};
+    new Chart(document.getElementById('chart-aging'), {
+        type: 'bar',
+        data: { labels: ['> 30 days','> 60 days','> 90 days'], datasets: [{data: [age.aging_30d||0, age.aging_60d||0, age.aging_90d||0], backgroundColor: ['#f59e0b','#ea580c','#ef4444'], borderRadius: 4}] },
+        options: { responsive: true, plugins: {legend:{display:false}} }
+    });
+
+    loadSLAConfig();
+}
+
+async function loadSLAConfig() {
+    const targets = await fetchApi('/api/sla-targets');
+    if (!targets) return;
+    const el = document.getElementById('sla-config');
+    el.innerHTML = Object.entries(targets).sort((a,b)=>b[0]-a[0]).map(([sev, days]) =>
+        `<div class="filter-group"><label>Severity ${sev}</label><input type="number" id="sla-${sev}" value="${days}" min="1" style="width:80px;"> days</div>`
+    ).join('');
+}
+
+async function saveSLA() {
+    const targets = {};
+    for (let s = 1; s <= 5; s++) {
+        const el = document.getElementById('sla-' + s);
+        if (el) targets[s] = parseInt(el.value) || 30;
+    }
+    await fetchApi('/api/sla-targets', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(targets) });
+    showToast('SLA targets saved', 'success');
+    loadKPIs();
+}
+
+loadKPIs();
+</script>
+{% endblock %}

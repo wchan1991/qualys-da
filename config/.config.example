@@ -1,0 +1,74 @@
+# ============================================================
+# QUALYS DATA ANALYTICS CONFIGURATION
+# ============================================================
+#
+# SETUP:
+# 1. Copy this file to '.config' (same folder)
+# 2. Fill in your credentials
+# 3. Secure: chmod 600 config/.config (Linux/Mac)
+#
+# IMPORTANT: Do NOT wrap values in quotes!
+#   CORRECT:   vm_base_url = https://qualysapi.qualys.eu
+#   WRONG:     vm_base_url = "https://qualysapi.qualys.eu"
+#
+# ENVIRONMENT VARIABLES (override file values):
+#   QUALYS_DA_USERNAME, QUALYS_DA_PASSWORD
+#   QUALYS_DA_VM_URL, QUALYS_DA_CSAM_URL
+# ============================================================
+
+[credentials]
+username =
+password =
+
+[api]
+# Platform URLs - find yours at https://www.qualys.com/platform-identification/
+# EU1 VM:   https://qualysapi.qualys.eu
+# EU1 CSAM: https://gateway.qg1.apps.qualys.eu
+# US1 VM:   https://qualysapi.qualys.com
+# US1 CSAM: https://gateway.qg1.apps.qualys.com
+vm_base_url = https://qualysapi.qualys.eu
+csam_base_url = https://gateway.qg1.apps.qualys.eu
+timeout = 60
+max_retries = 3
+
+[rate_limit]
+calls_per_minute = 60
+enabled = true
+
+[database]
+db_path = data/qualys_da.db
+
+[retention]
+# GFS (Grandfather-Father-Son) retention policy
+daily_retention_days = 30
+weekly_retention_weeks = 52
+# Monthly rollups kept indefinitely
+
+[analytics]
+trend_window_weeks = 12
+
+[tags]
+# Comma-separated list of tag names to monitor on the dashboard
+# These tags get highlighted metrics and trend tracking
+monitored_tags =
+
+[sla]
+# Remediation SLA windows in days per severity (also editable in-app)
+severity_5 = 7
+severity_4 = 30
+severity_3 = 90
+severity_2 = 180
+severity_1 = 365
+
+[ownership]
+# Optional: path to CSV file for bulk asset ownership import
+# Format: match_type,match_value,owner,business_unit
+# import_file = config/owners.csv
+
+[scheduler]
+enabled = true
+refresh_day = monday
+refresh_hour = 6
+
+[logging]
+level = INFO

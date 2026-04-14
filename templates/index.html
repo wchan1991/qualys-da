@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Dashboard</h1>
+    <div style="display:flex;gap:8px;align-items:center;">
+        <span id="last-refresh" class="metric-label"></span>
+        <label style="font-size:12px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">View</label>
+        <select id="view-select" class="btn" style="padding:6px 10px;">
+            <option value="weekly">Weekly (7d)</option>
+            <option value="monthly">Monthly (30d)</option>
+            <option value="yearly">Yearly (365d)</option>
+        </select>
+    </div>
+</div>
+
+<!-- Metric Cards (click → Query Builder scoped to selected view) -->
+<div class="metrics-grid" id="metrics-grid">
+    <a class="metric-card" data-card="total" title="View all detections"><div class="metric-value" id="m-total">--</div><div class="metric-label">Total Vulns</div></a>
+    <a class="metric-card" data-card="critical" title="View Sev 4+5 detections"><div class="metric-value severity-5" id="m-critical">--</div><div class="metric-label">Critical (4+5)</div></a>
+    <a class="metric-card" data-card="sev4" title="View Sev 4 detections"><div class="metric-value severity-4" id="m-sev4">--</div><div class="metric-label">High (Sev 4)</div></a>
+    <a class="metric-card" href="/hosts" title="Browse all hosts">
+        <div class="metric-value" id="m-hosts">--</div>
+        <div class="metric-label">Total Hosts</div>
+        <div class="metric-trend neutral" id="m-coverage">--</div>
+    </a>
+</div>
+<div class="metrics-grid" id="metrics-grid-status">
+    <a class="metric-card" data-card="new" title="View New detections"><div class="metric-value" style="color:var(--info)" id="m-new">--</div><div class="metric-label">New</div></a>
+    <a class="metric-card" data-card="active" title="View Active detections"><div class="metric-value" style="color:var(--warning)" id="m-active">--</div><div class="metric-label">Active</div></a>
+    <a class="metric-card" data-card="reopened" title="View Re-Opened detections"><div class="metric-value" style="color:var(--danger)" id="m-reopened">--</div><div class="metric-label">Re-Opened</div></a>
+    <a class="metric-card" data-card="fixed" title="View Fixed detections"><div class="metric-value" style="color:var(--success)" id="m-fixed">--</div><div class="metric-label">Fixed</div></a>
+</div>
+
+<!-- KPI Cards (clickable → opens Query tab with formula SQL pre-loaded) -->
+<div class="kpi-badges" id="kpi-badges">
+    <a href="/sql?formula=patchable" class="metric-card" title="Click to view and modify the formula"><div class="metric-value" id="kpi-patchable">--</div><div class="metric-label">% Patchable</div></a>
+    <a href="/sql?formula=mttr" class="metric-card" title="Click to view and modify the formula"><div class="metric-value" id="kpi-mttr">--</div><div class="metric-label">Avg MTTR (days)</div></a>
+    <a href="/sql?formula=sla" class="metric-card" title="Click to view and modify the formula"><div class="metric-value" id="kpi-sla">--</div><div class="metric-label">SLA Compliance</div></a>
+    <a href="/sql?formula=scan" class="metric-card" title="Click to view and modify the formula"><div class="metric-value" id="kpi-scan">--</div><div class="metric-label">Scan Coverage</div></a>
+    <a href="/sql?formula=reopen" class="metric-card" title="Click to view and modify the formula"><div class="metric-value" id="kpi-reopen">--</div><div class="metric-label">Reopen Rate</div></a>
+</div>
+
+<!-- Charts -->
+<div class="chart-row">
+    <div class="card">
+        <div class="card-header">Vulnerabilities by Severity</div>
+        <div class="chart-container"><canvas id="chart-severity"></canvas></div>
+    </div>
+    <div class="card">
+        <div class="card-header">Status Distribution</div>
+        <div class="chart-container"><canvas id="chart-status"></canvas></div>
+    </div>
+</div>
+<div class="card">
+    <div class="card-header">Top 10 Riskiest Hosts (TruRisk)</div>
+    <div class="chart-container"><canvas id="chart-risk"></canvas></div>
+</div>
+
+<!-- Ownership Drill-Down -->
+<div class="card">
+    <div class="card-header">
+        Ownership Breakdown
+        <span style="float:right;font-weight:400;font-size:13px;">
+            <a href="/six-pack" class="btn btn-sm">Full 6-Pack View &rarr;</a>
+        </span>
+    </div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Owner</th>
+                    <th style="text-align:right;">Total Vulns</th>
+                    <th style="text-align:right;">Avg Age</th>
+                    <th style="text-align:right;">SLA Breaches</th>
+                    <th style="text-align:right;">SLA %</th>
+                    <th style="text-align:center;">Status</th>
+                    <th style="text-align:center;">Drill-down</th>
+                </tr>
+            </thead>
+            <tbody id="owner-table">
+                <tr><td colspan="7" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let severityChart, statusChart, riskChart;
+
+async function loadDashboard() {
+    try {
+        const data = await fetchApi('/api/dashboard');
+        if (!data) return;
+
+        const vo = data.vuln_overview || {};
+        const cov = data.asset_coverage || {};
+        const kpi = data.kpi_badges || {};
+        const risk = data.risk_distribution || {};
+
+        // Metric cards
+        const st = vo.by_status || {};
+        setText('m-total', (vo.total || 0).toLocaleString());
+        setText('m-critical', (vo.critical_count || 0).toLocaleString());
+        setText('m-sev4', ((vo.by_severity || {})[4] || 0).toLocaleString());
+        setText('m-hosts', (cov.total_unique_ips || 0).toLocaleString());
+        setText('m-coverage', (cov.coverage_pct || 0) + '% coverage');
+        setText('m-new', (st['New'] || 0).toLocaleString());
+        setText('m-active', (st['Active'] || 0).toLocaleString());
+        setText('m-reopened', (st['Re-Opened'] || 0).toLocaleString());
+        setText('m-fixed', (st['Fixed'] || 0).toLocaleString());
+
+        // KPI badges
+        setText('kpi-patchable', (kpi.patchable_pct || 0) + '%');
+        setText('kpi-mttr', (kpi.avg_mttr || 0) + 'd');
+        setText('kpi-sla', (kpi.sla_compliance_pct || 0) + '%');
+        setText('kpi-scan', (kpi.scan_coverage_pct || 0) + '%');
+        setText('kpi-reopen', (kpi.reopen_rate || 0) + '%');
+
+        // Last refresh
+        if (data.last_refresh) {
+            setText('last-refresh', 'Last: ' + (data.last_refresh.completed_at || data.last_refresh.started_at || '').slice(0, 16));
+        }
+
+        // Severity chart
+        const sevData = vo.by_severity || {};
+        renderBarChart('chart-severity', severityChart,
+            ['Sev 1', 'Sev 2', 'Sev 3', 'Sev 4', 'Sev 5'],
+            [sevData[1]||0, sevData[2]||0, sevData[3]||0, sevData[4]||0, sevData[5]||0],
+            ['#94a3b8', '#3b82f6', '#f59e0b', '#ea580c', '#ef4444']
+        );
+
+        // Status chart
+        const stData = vo.by_status || {};
+        renderDoughnutChart('chart-status', statusChart,
+            ['New', 'Active', 'Fixed', 'Re-Opened'],
+            [stData['New']||0, stData['Active']||0, stData['Fixed']||0, stData['Re-Opened']||0],
+            ['#3b82f6', '#f59e0b', '#10b981', '#ef4444']
+        );
+
+        // Risk chart
+        const topRisky = (risk.top_riskiest || []).slice(0, 10);
+        if (topRisky.length) {
+            renderHBarChart('chart-risk', riskChart,
+                topRisky.map(h => h.ip_address || h.dns || 'Unknown'),
+                topRisky.map(h => h.trurisk_score || 0)
+            );
+        }
+    } catch (e) {
+        console.error('Dashboard load error:', e);
+    }
+}
+
+function renderBarChart(canvasId, existing, labels, values, colors) {
+    const ctx = document.getElementById(canvasId);
+    if (existing) existing.destroy();
+    return new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets: [{ data: values, backgroundColor: colors, borderRadius: 4 }] },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+    });
+}
+
+function renderDoughnutChart(canvasId, existing, labels, values, colors) {
+    const ctx = document.getElementById(canvasId);
+    if (existing) existing.destroy();
+    return new Chart(ctx, {
+        type: 'doughnut',
+        data: { labels, datasets: [{ data: values, backgroundColor: colors }] },
+        options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+    });
+}
+
+function renderHBarChart(canvasId, existing, labels, values) {
+    const ctx = document.getElementById(canvasId);
+    if (existing) existing.destroy();
+    return new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets: [{ data: values, backgroundColor: '#ef4444', borderRadius: 4 }] },
+        options: { indexAxis: 'y', responsive: true, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true } } }
+    });
+}
+
+// Default-view selector: drives the `days` window applied to card click-throughs
+const VIEW_DAYS = { weekly: 7, monthly: 30, yearly: 365 };
+function currentView() { return localStorage.getItem('qda_default_view') || 'monthly'; }
+function daysAgoISO(days) {
+    const d = new Date();
+    d.setDate(d.getDate() - days);
+    return d.toISOString().slice(0, 10);
+}
+
+// Each clickable metric card translates to a Query Builder URL
+const CARD_QUERIES = {
+    total:    () => '/query',
+    critical: () => '/query?severity_min=4',
+    sev4:     () => '/query?severity_min=4',
+    new:      () => '/query?status=New',
+    active:   () => '/query?status=Active',
+    reopened: () => '/query?status=Re-Opened',
+    fixed:    () => '/query?status=Fixed',
+};
+
+function updateCardLinks() {
+    const view = currentView();
+    const dateFrom = daysAgoISO(VIEW_DAYS[view] || 30);
+    document.querySelectorAll('.metric-card[data-card]').forEach(el => {
+        const key = el.getAttribute('data-card');
+        const base = (CARD_QUERIES[key] || (() => '/query'))();
+        const sep = base.includes('?') ? '&' : '?';
+        el.setAttribute('href', `${base}${sep}date_from=${dateFrom}&view=${view}`);
+    });
+}
+
+(function initViewSelect() {
+    const sel = document.getElementById('view-select');
+    sel.value = currentView();
+    sel.addEventListener('change', e => {
+        localStorage.setItem('qda_default_view', e.target.value);
+        updateCardLinks();
+        showToast('View: ' + e.target.value, 'success');
+    });
+    updateCardLinks();
+})();
+
+async function loadOwnership() {
+    const tbody = document.getElementById('owner-table');
+    try {
+        const data = await fetchApi('/api/six-pack?group_by=owner');
+        const groups = (data && data.groups) || [];
+        if (!groups.length) {
+            tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);padding:20px;text-align:center;">No ownership data — define rules on the Ownership page</td></tr>';
+            return;
+        }
+        tbody.innerHTML = groups.map(g => {
+            const slaPct = g.sla_compliance_pct || 0;
+            const cls = slaPct >= 90 ? 'sla-good' : slaPct >= 70 ? 'sla-warning' : 'sla-breach';
+            const badgeCls = cls === 'sla-good' ? 'badge-low' : cls === 'sla-warning' ? 'badge-medium' : 'badge-critical';
+            const badgeText = cls === 'sla-good' ? 'Good' : cls === 'sla-warning' ? 'Warning' : 'Breach';
+            return `<tr>
+                <td><strong>${g.name || 'Unknown'}</strong>${g.business_unit ? '<br><small style="color:var(--text-muted)">' + g.business_unit + '</small>' : ''}</td>
+                <td style="text-align:right;">${(g.total_vulns || 0).toLocaleString()}</td>
+                <td style="text-align:right;">${g.weighted_avg_age || 0}d</td>
+                <td style="text-align:right;" class="${cls}">${(g.sla_breaching || 0).toLocaleString()}</td>
+                <td style="text-align:right;" class="${cls}">${slaPct}%</td>
+                <td style="text-align:center;"><span class="badge ${badgeCls}">${badgeText}</span></td>
+                <td style="text-align:center;">
+                    <a href="/six-pack" class="btn btn-sm" title="Open full 6-Pack view">6-Pack</a>
+                    <a href="/hosts?owner=${encodeURIComponent(g.name || '')}" class="btn btn-sm" title="View hosts for this owner">Hosts</a>
+                </td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="7" style="color:var(--danger);padding:20px;text-align:center;">Error: ' + e.message + '</td></tr>';
+    }
+}
+
+loadDashboard();
+loadOwnership();
+</script>
+{% endblock %}

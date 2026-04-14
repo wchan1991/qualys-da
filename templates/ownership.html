@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block title %}Asset Ownership - Qualys DA{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Asset Ownership</h1>
+    <div style="display:flex;gap:8px;">
+        <button class="btn" onclick="showImportModal()">Import CSV</button>
+        <button class="btn btn-primary" onclick="showAddModal()">Add Rule</button>
+    </div>
+</div>
+
+<div class="tabs">
+    <div class="tab active" onclick="showOwnerTab('rules')">Ownership Rules</div>
+    <div class="tab" onclick="showOwnerTab('unassigned')">Unassigned Assets</div>
+    <div class="tab" onclick="showOwnerTab('preview')">Rule Preview</div>
+</div>
+
+<!-- Rules Tab -->
+<div id="tab-rules">
+    <div class="card">
+        <div class="card-header">Ownership Rules <span id="rule-count"></span></div>
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Match Type</th>
+                        <th>Match Value</th>
+                        <th>Owner</th>
+                        <th>Business Unit</th>
+                        <th>Notes</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="rules-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Unassigned Tab -->
+<div id="tab-unassigned" style="display:none;">
+    <div class="card">
+        <div class="card-header">Unassigned Assets</div>
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead>
+                    <tr><th>IP Address</th><th>Hostname</th><th>OS</th><th>TruRisk</th><th>Actions</th></tr>
+                </thead>
+                <tbody id="unassigned-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Preview Tab -->
+<div id="tab-preview" style="display:none;">
+    <div class="filter-panel">
+        <div class="filter-group">
+            <label>Match Type</label>
+            <select id="preview-type">
+                <option value="ip">IP Address</option>
+                <option value="ip_range">IP Range (CIDR)</option>
+                <option value="tag">Tag</option>
+                <option value="os_pattern">OS Pattern</option>
+            </select>
+        </div>
+        <div class="filter-group">
+            <label>Match Value</label>
+            <input type="text" id="preview-value" placeholder="e.g. 10.1.0.0/16">
+        </div>
+        <button class="btn btn-primary" onclick="previewRule()">Preview Matches</button>
+    </div>
+    <div class="card">
+        <div class="card-header">Matching Assets <span id="preview-count"></span></div>
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead>
+                    <tr><th>IP Address</th><th>Hostname</th><th>OS</th><th>TruRisk</th></tr>
+                </thead>
+                <tbody id="preview-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Add/Edit Modal -->
+<div id="rule-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+    <div class="card" style="width:480px;max-width:90vw;">
+        <div class="card-header" id="modal-title">Add Ownership Rule</div>
+        <input type="hidden" id="edit-id">
+        <div class="form-row">
+            <label>Match Type</label>
+            <select id="rule-type">
+                <option value="ip">IP Address</option>
+                <option value="ip_range">IP Range (CIDR)</option>
+                <option value="tag">Tag</option>
+                <option value="os_pattern">OS Pattern</option>
+                <option value="asset_id">Asset ID</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>Match Value</label>
+            <input type="text" id="rule-value" placeholder="e.g. 10.1.0.0/16 or Windows%">
+        </div>
+        <div class="form-row">
+            <label>Owner</label>
+            <input type="text" id="rule-owner" placeholder="e.g. John Smith">
+        </div>
+        <div class="form-row">
+            <label>Business Unit</label>
+            <input type="text" id="rule-bu" placeholder="e.g. Infrastructure">
+        </div>
+        <div class="form-row">
+            <label>Notes</label>
+            <input type="text" id="rule-notes" placeholder="Optional notes">
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+            <button class="btn btn-primary" onclick="saveRule()">Save</button>
+            <button class="btn" onclick="closeModal()">Cancel</button>
+        </div>
+    </div>
+</div>
+
+<!-- Import Modal -->
+<div id="import-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+    <div class="card" style="width:480px;max-width:90vw;">
+        <div class="card-header">Import Ownership CSV</div>
+        <p style="margin-bottom:12px;color:var(--text-muted);font-size:13px;">
+            CSV format: match_type, match_value, owner, business_unit<br>
+            Example: ip_range, 10.1.0.0/16, John Smith, Infrastructure
+        </p>
+        <div class="form-row">
+            <label>CSV File</label>
+            <input type="file" id="import-file" accept=".csv">
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+            <button class="btn btn-primary" onclick="importCSV()">Import</button>
+            <button class="btn" onclick="closeImportModal()">Cancel</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function showOwnerTab(name) {
+    ['rules','unassigned','preview'].forEach(t => {
+        document.getElementById('tab-'+t).style.display = t === name ? '' : 'none';
+    });
+    document.querySelectorAll('.tab').forEach((el,i) => {
+        el.classList.toggle('active', ['rules','unassigned','preview'][i] === name);
+    });
+    if (name === 'unassigned') loadUnassigned();
+}
+
+async function loadRules() {
+    const data = await fetchApi('/api/owners');
+    if (!data) return;
+    document.getElementById('rule-count').textContent = '(' + data.length + ' rules)';
+    document.getElementById('rules-body').innerHTML = data.map(r => `<tr>
+        <td><span class="badge badge-low">${r.match_type}</span></td>
+        <td>${r.match_value}</td>
+        <td><strong>${r.owner}</strong></td>
+        <td>${r.business_unit || ''}</td>
+        <td style="color:var(--text-muted)">${r.notes || ''}</td>
+        <td>
+            <button class="btn btn-sm" onclick="editRule(${r.id},'${r.match_type}','${r.match_value}','${r.owner}','${r.business_unit||''}','${r.notes||''}')">Edit</button>
+            <button class="btn btn-sm" style="color:var(--danger)" onclick="deleteRule(${r.id})">Delete</button>
+        </td>
+    </tr>`).join('');
+}
+
+async function loadUnassigned() {
+    const data = await fetchApi('/api/owners/unassigned');
+    if (!data) return;
+    document.getElementById('unassigned-body').innerHTML = data.map(h => `<tr>
+        <td>${h.ip_address || ''}</td>
+        <td>${h.dns || ''}</td>
+        <td>${h.os || ''}</td>
+        <td>${h.trurisk_score || 0}</td>
+        <td><button class="btn btn-sm" onclick="quickAssign('${h.ip_address}')">Assign</button></td>
+    </tr>`).join('');
+}
+
+async function previewRule() {
+    const type = document.getElementById('preview-type').value;
+    const value = document.getElementById('preview-value').value;
+    if (!value) { showToast('Enter a match value', 'error'); return; }
+    const data = await fetchApi('/api/owners/preview?match_type=' + type + '&match_value=' + encodeURIComponent(value));
+    if (!data) return;
+    document.getElementById('preview-count').textContent = '(' + data.length + ' matches)';
+    document.getElementById('preview-body').innerHTML = data.map(h => `<tr>
+        <td>${h.ip_address || ''}</td>
+        <td>${h.dns || ''}</td>
+        <td>${h.os || ''}</td>
+        <td>${h.trurisk_score || 0}</td>
+    </tr>`).join('');
+}
+
+function showAddModal() {
+    document.getElementById('modal-title').textContent = 'Add Ownership Rule';
+    document.getElementById('edit-id').value = '';
+    document.getElementById('rule-type').value = 'ip';
+    document.getElementById('rule-value').value = '';
+    document.getElementById('rule-owner').value = '';
+    document.getElementById('rule-bu').value = '';
+    document.getElementById('rule-notes').value = '';
+    document.getElementById('rule-modal').style.display = 'flex';
+}
+
+function editRule(id, type, value, owner, bu, notes) {
+    document.getElementById('modal-title').textContent = 'Edit Ownership Rule';
+    document.getElementById('edit-id').value = id;
+    document.getElementById('rule-type').value = type;
+    document.getElementById('rule-value').value = value;
+    document.getElementById('rule-owner').value = owner;
+    document.getElementById('rule-bu').value = bu;
+    document.getElementById('rule-notes').value = notes;
+    document.getElementById('rule-modal').style.display = 'flex';
+}
+
+function closeModal() { document.getElementById('rule-modal').style.display = 'none'; }
+
+async function saveRule() {
+    const id = document.getElementById('edit-id').value;
+    const body = {
+        match_type: document.getElementById('rule-type').value,
+        match_value: document.getElementById('rule-value').value,
+        owner: document.getElementById('rule-owner').value,
+        business_unit: document.getElementById('rule-bu').value,
+        notes: document.getElementById('rule-notes').value
+    };
+    if (!body.match_value || !body.owner) { showToast('Match value and owner are required', 'error'); return; }
+    const url = id ? '/api/owners/' + id : '/api/owners';
+    const method = id ? 'PUT' : 'POST';
+    await fetchApi(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    closeModal();
+    showToast('Rule saved', 'success');
+    loadRules();
+}
+
+async function deleteRule(id) {
+    if (!confirm('Delete this ownership rule?')) return;
+    await fetchApi('/api/owners/' + id, { method: 'DELETE' });
+    showToast('Rule deleted', 'success');
+    loadRules();
+}
+
+function quickAssign(ip) {
+    document.getElementById('rule-type').value = 'ip';
+    document.getElementById('rule-value').value = ip;
+    showAddModal();
+    document.getElementById('rule-value').value = ip;
+    document.getElementById('rule-type').value = 'ip';
+}
+
+function showImportModal() { document.getElementById('import-modal').style.display = 'flex'; }
+function closeImportModal() { document.getElementById('import-modal').style.display = 'none'; }
+
+async function importCSV() {
+    const file = document.getElementById('import-file').files[0];
+    if (!file) { showToast('Select a CSV file', 'error'); return; }
+    const formData = new FormData();
+    formData.append('file', file);
+    const resp = await fetch('/api/owners/import', { method: 'POST', body: formData });
+    const result = await resp.json();
+    closeImportModal();
+    if (result.error) { showToast(result.error, 'error'); }
+    else { showToast('Imported ' + (result.imported || 0) + ' rules', 'success'); }
+    loadRules();
+}
+
+loadRules();
+</script>
+{% endblock %}

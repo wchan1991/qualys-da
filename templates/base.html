@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Qualys Data Analytics{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">
+            <span>Qualys DA</span>
+        </div>
+        <div class="nav-links">
+            {% set dash_ep = ['index', 'six_pack_page', 'kpis_page', 'trends_page', 'cve_dashboard_page', 'patchable_dashboard_page'] %}
+            {% set hosts_ep = ['hosts_page', 'tags_page', 'orphaned_page'] %}
+            {% set query_ep = ['query_page', 'custom_query_page'] %}
+            <div class="nav-dropdown">
+                <a href="{{ url_for('index') }}" class="nav-link {% if request.endpoint in dash_ep %}active{% endif %}">Dashboard &#9662;</a>
+                <div class="nav-submenu">
+                    <a href="{{ url_for('index') }}">Overview</a>
+                    <a href="{{ url_for('cve_dashboard_page') }}">CVE Dashboard</a>
+                    <a href="{{ url_for('patchable_dashboard_page') }}">Patchable Dashboard</a>
+                    <a href="{{ url_for('six_pack_page') }}">6-Pack</a>
+                    <a href="{{ url_for('kpis_page') }}">KPIs</a>
+                    <a href="{{ url_for('trends_page') }}">Trends</a>
+                </div>
+            </div>
+            <div class="nav-dropdown">
+                <a href="{{ url_for('hosts_page') }}" class="nav-link {% if request.endpoint in hosts_ep %}active{% endif %}">Hosts &#9662;</a>
+                <div class="nav-submenu">
+                    <a href="{{ url_for('hosts_page') }}">Hosts</a>
+                    <a href="{{ url_for('tags_page') }}">Tags</a>
+                    <a href="{{ url_for('orphaned_page') }}">Orphaned Assets</a>
+                </div>
+            </div>
+            <a href="{{ url_for('ownership_page') }}" class="nav-link {% if request.endpoint == 'ownership_page' %}active{% endif %}">Ownership</a>
+            <div class="nav-dropdown">
+                <a href="{{ url_for('query_page') }}" class="nav-link {% if request.endpoint in query_ep %}active{% endif %}">Query &#9662;</a>
+                <div class="nav-submenu">
+                    <a href="{{ url_for('query_page') }}">Query Builder</a>
+                    <a href="{{ url_for('custom_query_page') }}">SQL</a>
+                </div>
+            </div>
+            <a href="{{ url_for('settings_page') }}" class="nav-link {% if request.endpoint == 'settings_page' %}active{% endif %}">Settings</a>
+        </div>
+        <div class="nav-actions">
+            <button id="theme-toggle" class="btn btn-icon" title="Toggle theme" onclick="toggleTheme()">&#9789;</button>
+            <span id="connection-dot" class="status-dot" title="Checking..."></span>
+        </div>
+    </nav>
+
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+
+    <div id="toast-container"></div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

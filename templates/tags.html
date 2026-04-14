@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}Tag Analysis - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Tag Analysis</h1>
+    <button class="btn" onclick="exportTagCSV()">Export CSV</button>
+</div>
+
+<div class="tabs">
+    <div class="tab active" onclick="showTab('overview')">Overview</div>
+    <div class="tab" onclick="showTab('detail')">Tag Detail</div>
+    <div class="tab" onclick="showTab('compare')">Compare</div>
+    <div class="tab" onclick="showTab('monitored')">Monitored</div>
+</div>
+
+<div id="tab-overview">
+    <div class="chart-row">
+        <div class="card">
+            <div class="card-header">Vulnerabilities by Tag (Top 15)</div>
+            <div class="chart-container"><canvas id="chart-tag-vulns"></canvas></div>
+        </div>
+        <div class="card">
+            <div class="card-header">Host Count by Tag (Top 15)</div>
+            <div class="chart-container"><canvas id="chart-tag-hosts"></canvas></div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header">All Tags</div>
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead><tr><th>Tag Name</th><th>Hosts</th><th>Open Vulns</th><th>Avg Severity</th><th>Avg TruRisk</th><th>Actions</th></tr></thead>
+                <tbody id="tag-table"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div id="tab-detail" style="display:none;">
+    <div class="filter-panel">
+        <div class="filter-group">
+            <label>Select Tag</label>
+            <select id="detail-tag" onchange="loadTagDetail()"><option value="">Choose...</option></select>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header">Tag: <span id="detail-tag-name">--</span></div>
+        <div class="metrics-grid" id="detail-metrics"></div>
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead><tr><th>IP</th><th>Host ID</th><th>DNS</th><th>OS</th><th>TruRisk</th></tr></thead>
+                <tbody id="detail-hosts"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div id="tab-compare" style="display:none;">
+    <div class="filter-panel">
+        <div class="filter-group">
+            <label>Select Tags to Compare</label>
+            <select id="compare-tags" multiple size="6"></select>
+        </div>
+        <button class="btn btn-primary" onclick="compareTags()">Compare</button>
+    </div>
+    <div class="card">
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead><tr><th>Tag</th><th>Hosts</th><th>Total Vulns</th><th>Sev 5</th><th>Sev 4</th><th>Sev 3</th></tr></thead>
+                <tbody id="compare-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div id="tab-monitored" style="display:none;">
+    <div class="card">
+        <div class="card-header">Monitored Tags</div>
+        <div class="metrics-grid" id="monitored-grid"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let tagData = [];
+
+function showTab(name) {
+    ['overview','detail','compare','monitored'].forEach(t => {
+        document.getElementById('tab-'+t).style.display = t === name ? '' : 'none';
+    });
+    document.querySelectorAll('.tab').forEach((el,i) => {
+        el.classList.toggle('active', ['overview','detail','compare','monitored'][i] === name);
+    });
+}
+
+async function loadTags() {
+    tagData = await fetchApi('/api/tags') || [];
+    const body = document.getElementById('tag-table');
+    body.innerHTML = tagData.map(t => `<tr>
+        <td>${t.tag_name}</td>
+        <td>${t.host_count}</td>
+        <td>${t.vuln_count}</td>
+        <td>${(t.avg_severity||0).toFixed(1)}</td>
+        <td>${Math.round(t.avg_trurisk||0)}</td>
+        <td><button class="btn btn-sm" onclick="selectTag('${t.tag_name}')">Detail</button></td>
+    </tr>`).join('');
+
+    // Populate selects
+    ['detail-tag','compare-tags'].forEach(id => {
+        const sel = document.getElementById(id);
+        tagData.forEach(t => {
+            const opt = document.createElement('option');
+            opt.value = t.tag_name;
+            opt.textContent = t.tag_name;
+            sel.appendChild(opt);
+        });
+    });
+
+    // Charts
+    const top = tagData.slice(0, 15);
+    if (top.length) {
+        new Chart(document.getElementById('chart-tag-vulns'), {
+            type: 'bar', data: { labels: top.map(t=>t.tag_name), datasets: [{data: top.map(t=>t.vuln_count), backgroundColor: '#ef4444', borderRadius: 4}] },
+            options: { indexAxis: 'y', responsive: true, plugins: { legend: {display:false} } }
+        });
+        new Chart(document.getElementById('chart-tag-hosts'), {
+            type: 'bar', data: { labels: top.map(t=>t.tag_name), datasets: [{data: top.map(t=>t.host_count), backgroundColor: '#3b82f6', borderRadius: 4}] },
+            options: { indexAxis: 'y', responsive: true, plugins: { legend: {display:false} } }
+        });
+    }
+}
+
+function selectTag(name) {
+    document.getElementById('detail-tag').value = name;
+    showTab('detail');
+    loadTagDetail();
+}
+
+async function loadTagDetail() {
+    const name = document.getElementById('detail-tag').value;
+    if (!name) return;
+    const data = await fetchApi('/api/tags/' + encodeURIComponent(name));
+    if (!data) return;
+    document.getElementById('detail-tag-name').textContent = name;
+    const vs = data.vuln_summary || {};
+    document.getElementById('detail-metrics').innerHTML = `
+        <div class="metric-card"><div class="metric-value">${data.hosts?.length || 0}</div><div class="metric-label">Hosts</div></div>
+        <div class="metric-card"><div class="metric-value">${vs.total || 0}</div><div class="metric-label">Open Vulns</div></div>
+        <div class="metric-card"><div class="metric-value severity-5">${(vs.by_severity||{})[5]||0}</div><div class="metric-label">Sev 5</div></div>
+        <div class="metric-card"><div class="metric-value severity-4">${(vs.by_severity||{})[4]||0}</div><div class="metric-label">Sev 4</div></div>
+    `;
+    document.getElementById('detail-hosts').innerHTML = (data.hosts||[]).map(h => `<tr>
+        <td><a href="/hosts?ip=${h.ip_address}">${h.ip_address||''}</a></td>
+        <td>${h.host_id||''}</td><td>${h.dns||''}</td><td>${h.os||''}</td><td>${h.trurisk_score||0}</td>
+    </tr>`).join('');
+}
+
+async function compareTags() {
+    const sel = document.getElementById('compare-tags');
+    const names = Array.from(sel.selectedOptions).map(o=>o.value);
+    if (names.length < 2) { showToast('Select at least 2 tags', 'error'); return; }
+    const data = await fetchApi('/api/metrics/tag-comparison?tags=' + names.join(','));
+    if (!data) return;
+    document.getElementById('compare-body').innerHTML = data.map(t => {
+        const vs = t.vuln_summary || {};
+        return `<tr><td>${t.tag_name}</td><td>${t.host_count}</td><td>${vs.total||0}</td>
+            <td class="severity-5">${(vs.by_severity||{})[5]||0}</td>
+            <td class="severity-4">${(vs.by_severity||{})[4]||0}</td>
+            <td class="severity-3">${(vs.by_severity||{})[3]||0}</td></tr>`;
+    }).join('');
+}
+
+async function loadMonitored() {
+    const data = await fetchApi('/api/tags/monitored');
+    const grid = document.getElementById('monitored-grid');
+    if (!data || !data.length) { grid.innerHTML = '<div class="empty-state"><h3>No monitored tags configured</h3><p>Set monitored_tags in config/.config</p></div>'; return; }
+    grid.innerHTML = data.map(t => `
+        <div class="metric-card" onclick="selectTag('${t.tag_name}')" style="cursor:pointer">
+            <div class="metric-value">${t.vuln_summary?.total || 0}</div>
+            <div class="metric-label">${t.tag_name}</div>
+            <div class="metric-trend">${t.host_count} hosts</div>
+        </div>
+    `).join('');
+}
+
+function exportTagCSV() { window.location = '/api/export/csv?type=detections'; }
+
+loadTags();
+loadMonitored();
+</script>
+{% endblock %}

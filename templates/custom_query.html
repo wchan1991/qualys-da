@@ -1,0 +1,355 @@
+{% extends "base.html" %}
+{% block title %}Custom Query - Qualys DA{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Custom SQL Query</h1>
+    <div style="display:flex;gap:8px;">
+        <button class="btn" onclick="exportResults()">Export CSV</button>
+        <button class="btn" onclick="showSaveModal()">Save Query</button>
+        <button class="btn btn-primary" onclick="executeQuery()">Run Query</button>
+    </div>
+</div>
+
+<div style="display:grid;grid-template-columns:250px 1fr;gap:16px;">
+    <!-- Sidebar: Saved Queries + Templates -->
+    <div>
+        <div class="card">
+            <div class="card-header">Templates</div>
+            <div id="templates-list" style="font-size:13px;"></div>
+        </div>
+        <div class="card" style="margin-top:12px;">
+            <div class="card-header">Saved Queries</div>
+            <div id="saved-list" style="font-size:13px;"></div>
+        </div>
+        <div class="card" style="margin-top:12px;">
+            <div class="card-header">Available Views</div>
+            <div style="font-size:12px;color:var(--text-muted);padding:4px 0;">
+                <div style="margin-bottom:4px;"><strong>v_detections</strong> — Detections + host + tags + owner</div>
+                <div style="margin-bottom:4px;"><strong>v_hosts</strong> — VM hosts + CSAM + tags + owner</div>
+                <div style="margin-bottom:4px;"><strong>v_assets</strong> — CSAM assets + tags + owner</div>
+                <div><strong>v_changes</strong> — Detection changes log</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main: Editor + Results -->
+    <div>
+        <div class="card">
+            <div class="card-header">SQL Editor <span style="font-size:12px;color:var(--text-muted)">(SELECT only)</span></div>
+            <textarea id="sql-editor" class="sql-editor" rows="8" placeholder="SELECT * FROM v_detections WHERE severity >= 4 LIMIT 100"></textarea>
+            <div style="display:flex;gap:8px;margin-top:8px;align-items:center;">
+                <button class="btn btn-primary" onclick="executeQuery()">Execute (Ctrl+Enter)</button>
+                <span id="query-status" style="font-size:12px;color:var(--text-muted)"></span>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:12px;">
+            <div class="card-header">Results <span id="result-count"></span></div>
+            <div class="table-wrapper">
+                <table class="data-table" id="results-table">
+                    <thead id="results-head"></thead>
+                    <tbody id="results-body"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Pandas Toolbar -->
+        <div class="card" style="margin-top:12px;">
+            <div class="card-header">Post-Processing <span style="font-size:12px;color:var(--text-muted);font-weight:400;">(powered by pandas)</span></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
+                <div class="filter-group">
+                    <label>Operation</label>
+                    <select id="pp-operation">
+                        <option value="describe">Describe (Stats)</option>
+                        <option value="group">Group By</option>
+                        <option value="pivot">Pivot</option>
+                        <option value="rolling">Rolling Average</option>
+                        <option value="percentiles">Percentiles (P50/P90/P95/P99)</option>
+                        <option value="correlation">Correlation Matrix</option>
+                    </select>
+                </div>
+                <div class="filter-group" id="pp-group-col" style="display:none;">
+                    <label>Group / Index Column</label>
+                    <select id="pp-group-by"></select>
+                </div>
+                <div class="filter-group" id="pp-pivot-col" style="display:none;">
+                    <label>Pivot Columns</label>
+                    <select id="pp-pivot"></select>
+                </div>
+                <div class="filter-group" id="pp-agg-col" style="display:none;">
+                    <label>Aggregate</label>
+                    <select id="pp-agg-func">
+                        <option value="count">Count</option>
+                        <option value="sum">Sum</option>
+                        <option value="mean">Mean</option>
+                        <option value="min">Min</option>
+                        <option value="max">Max</option>
+                    </select>
+                </div>
+                <div class="filter-group" id="pp-value-col" style="display:none;">
+                    <label>Value Column</label>
+                    <select id="pp-value"></select>
+                </div>
+                <div class="filter-group" id="pp-window-col" style="display:none;">
+                    <label>Window</label>
+                    <input type="number" id="pp-window" value="4" min="2" max="52" style="width:80px;">
+                </div>
+                <button class="btn btn-primary" onclick="postProcess()">Apply</button>
+                <button class="btn" onclick="exportExcel()">Export Excel</button>
+                <span id="pp-status" style="font-size:12px;color:var(--text-muted);"></span>
+            </div>
+            <div class="table-wrapper" style="margin-top:8px;">
+                <table class="data-table" id="pp-table">
+                    <thead id="pp-head"></thead>
+                    <tbody id="pp-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Save Modal -->
+<div id="save-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+    <div class="card" style="width:400px;max-width:90vw;">
+        <div class="card-header">Save Query</div>
+        <div class="form-row">
+            <label>Name</label>
+            <input type="text" id="save-name" placeholder="My query name">
+        </div>
+        <div class="form-row">
+            <label>Description</label>
+            <input type="text" id="save-desc" placeholder="Optional description">
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+            <button class="btn btn-primary" onclick="saveQuery()">Save</button>
+            <button class="btn" onclick="closeSaveModal()">Cancel</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentResults = { columns: [], rows: [] };
+
+// KPI formulas — loaded from dashboard KPI card clicks via ?formula=<key>
+const KPI_FORMULAS = {
+    patchable: {
+        title: '% Patchable',
+        sql: "-- % Patchable: share of open detections where a patch exists (type = Confirmed)\nSELECT\n  ROUND(100.0 * SUM(CASE WHEN detection_type = 'Confirmed' THEN 1 ELSE 0 END) / COUNT(*), 1) AS patchable_pct,\n  COUNT(*) AS total_open\nFROM v_detections\nWHERE status IN ('New','Active') AND is_disabled = 0"
+    },
+    mttr: {
+        title: 'Average MTTR (days)',
+        sql: "-- Mean Time To Remediate: average days from first_found to last_fixed, per severity\nSELECT severity,\n  ROUND(AVG(julianday(last_fixed) - julianday(first_found)), 1) AS avg_mttr_days,\n  COUNT(*) AS fixed_count\nFROM v_detections\nWHERE status = 'Fixed' AND last_fixed IS NOT NULL\nGROUP BY severity\nORDER BY severity DESC"
+    },
+    sla: {
+        title: 'SLA Compliance %',
+        sql: "-- SLA compliance: % of open detections NOT past the per-severity SLA window\n--   Sev 5 = 7d, Sev 4 = 30d, Sev 3 = 90d, Sev 2 = 180d, Sev 1 = 365d\nSELECT severity,\n  COUNT(*) AS open_total,\n  SUM(CASE WHEN julianday('now') - julianday(first_found) >\n       CASE severity WHEN 5 THEN 7 WHEN 4 THEN 30 WHEN 3 THEN 90 WHEN 2 THEN 180 ELSE 365 END\n       THEN 1 ELSE 0 END) AS breaches,\n  ROUND(100.0 * (COUNT(*) - SUM(CASE WHEN julianday('now') - julianday(first_found) >\n       CASE severity WHEN 5 THEN 7 WHEN 4 THEN 30 WHEN 3 THEN 90 WHEN 2 THEN 180 ELSE 365 END\n       THEN 1 ELSE 0 END)) / COUNT(*), 1) AS compliance_pct\nFROM v_detections\nWHERE status IN ('New','Active') AND is_disabled = 0\nGROUP BY severity\nORDER BY severity DESC"
+    },
+    scan: {
+        title: 'Scan Coverage % (7d / 30d)',
+        sql: "-- Scan coverage: share of VM hosts with a recent scan\nSELECT\n  COUNT(DISTINCT ip_address) AS total_hosts,\n  SUM(CASE WHEN julianday('now') - julianday(last_scan_date) <= 7 THEN 1 ELSE 0 END) AS scanned_7d,\n  SUM(CASE WHEN julianday('now') - julianday(last_scan_date) <= 30 THEN 1 ELSE 0 END) AS scanned_30d,\n  ROUND(100.0 * SUM(CASE WHEN julianday('now') - julianday(last_scan_date) <= 7  THEN 1 ELSE 0 END) / COUNT(DISTINCT ip_address), 1) AS pct_7d,\n  ROUND(100.0 * SUM(CASE WHEN julianday('now') - julianday(last_scan_date) <= 30 THEN 1 ELSE 0 END) / COUNT(DISTINCT ip_address), 1) AS pct_30d\nFROM v_hosts"
+    },
+    reopen: {
+        title: 'Reopen Rate %',
+        sql: "-- Reopen rate: share of once-fixed detections that have been re-opened\nSELECT\n  SUM(CASE WHEN status = 'Re-Opened' THEN 1 ELSE 0 END) AS reopened,\n  SUM(CASE WHEN status IN ('Fixed','Re-Opened') THEN 1 ELSE 0 END) AS fixed_plus_reopened,\n  ROUND(100.0 * SUM(CASE WHEN status = 'Re-Opened' THEN 1 ELSE 0 END)\n        / NULLIF(SUM(CASE WHEN status IN ('Fixed','Re-Opened') THEN 1 ELSE 0 END), 0), 1) AS reopen_pct\nFROM v_detections"
+    }
+};
+
+const queryTemplates = [
+    { name: 'Top 20 hosts by vulns', sql: "SELECT ip_address, COUNT(*) as vuln_count, AVG(severity) as avg_sev\nFROM v_detections\nWHERE status != 'Fixed'\nGROUP BY ip_address\nORDER BY vuln_count DESC\nLIMIT 20" },
+    { name: 'Sev 5 open > 7 days', sql: "SELECT ip_address, qid, severity, status, first_found,\n  CAST(julianday('now') - julianday(first_found) AS INTEGER) as age_days\nFROM v_detections\nWHERE severity = 5 AND status IN ('New','Active')\n  AND julianday('now') - julianday(first_found) > 7\nORDER BY age_days DESC" },
+    { name: 'Unscanned 30+ days', sql: "SELECT ip_address, dns, os, last_scan_date,\n  CAST(julianday('now') - julianday(last_scan_date) AS INTEGER) as days_since\nFROM v_hosts\nWHERE julianday('now') - julianday(last_scan_date) > 30\nORDER BY days_since DESC" },
+    { name: 'Vulns by owner & severity', sql: "SELECT owner, severity, COUNT(*) as count\nFROM v_detections\nWHERE status != 'Fixed'\nGROUP BY owner, severity\nORDER BY owner, severity DESC" },
+    { name: 'Tag coverage gaps', sql: "SELECT tag_name, COUNT(DISTINCT ip_address) as hosts,\n  SUM(CASE WHEN severity >= 4 THEN 1 ELSE 0 END) as critical_vulns\nFROM v_detections\nGROUP BY tag_name\nORDER BY critical_vulns DESC" },
+    { name: 'MTTR by OS family', sql: "SELECT\n  CASE\n    WHEN os LIKE '%Windows%' THEN 'Windows'\n    WHEN os LIKE '%Linux%' OR os LIKE '%Ubuntu%' THEN 'Linux'\n    ELSE 'Other'\n  END as os_family,\n  ROUND(AVG(julianday(last_fixed) - julianday(first_found)),1) as avg_mttr,\n  COUNT(*) as fixed_count\nFROM v_detections\nWHERE status = 'Fixed' AND last_fixed IS NOT NULL\nGROUP BY os_family" }
+];
+
+function loadTemplates() {
+    document.getElementById('templates-list').innerHTML = queryTemplates.map((t, i) =>
+        `<div style="padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--border-color);" onclick="loadTemplate(${i})" onmouseover="this.style.background='var(--bg-tertiary)'" onmouseout="this.style.background=''">${t.name}</div>`
+    ).join('');
+}
+
+function loadTemplate(i) {
+    document.getElementById('sql-editor').value = queryTemplates[i].sql;
+}
+
+let savedQueryMap = {};
+
+async function loadSaved() {
+    const data = await fetchApi('/api/query/saved');
+    if (!data) return;
+    savedQueryMap = {};
+    data.forEach(q => savedQueryMap[q.id] = q.sql_text);
+    document.getElementById('saved-list').innerHTML = data.length ? data.map(q =>
+        `<div style="padding:6px 8px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border-color);">
+            <span style="cursor:pointer;flex:1;" onclick="loadSavedQuery(${q.id})" title="${(q.description || '').replace(/"/g, '&quot;')}">${q.name}</span>
+            <button class="btn btn-sm" style="color:var(--danger);padding:2px 6px;" onclick="deleteSaved(${q.id})">×</button>
+        </div>`
+    ).join('') : '<div style="padding:8px;color:var(--text-muted)">No saved queries</div>';
+}
+
+function loadSavedQuery(id) {
+    const sql = savedQueryMap[id];
+    if (sql) document.getElementById('sql-editor').value = sql;
+}
+
+async function executeQuery() {
+    const sql = document.getElementById('sql-editor').value.trim();
+    if (!sql) { showToast('Enter a SQL query', 'error'); return; }
+    document.getElementById('query-status').textContent = 'Executing...';
+    const data = await fetchApi('/api/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({sql}) });
+    if (!data) { document.getElementById('query-status').textContent = 'Error'; return; }
+    if (data.error) { document.getElementById('query-status').textContent = data.error; showToast(data.error, 'error'); return; }
+
+    currentResults = data;
+    const cols = data.columns || [];
+    const rows = data.rows || [];
+    document.getElementById('result-count').textContent = '(' + rows.length + ' rows)';
+    document.getElementById('query-status').textContent = rows.length + ' rows returned';
+    document.getElementById('results-head').innerHTML = '<tr>' + cols.map(c => '<th>' + c + '</th>').join('') + '</tr>';
+    document.getElementById('results-body').innerHTML = rows.map(r =>
+        '<tr>' + cols.map(c => '<td>' + (r[c] !== null && r[c] !== undefined ? r[c] : '') + '</td>').join('') + '</tr>'
+    ).join('');
+
+    // Populate post-processing selects
+    ['pp-group-by', 'pp-value', 'pp-pivot'].forEach(id => {
+        const sel = document.getElementById(id);
+        if (sel) sel.innerHTML = cols.map(c => '<option value="' + c + '">' + c + '</option>').join('');
+    });
+}
+
+async function exportExcel() {
+    const payload = window.lastPpResult && window.lastPpResult.rows.length
+        ? window.lastPpResult
+        : currentResults;
+    if (!payload.rows || !payload.rows.length) { showToast('No results to export', 'error'); return; }
+    const resp = await fetch('/api/query/export/xlsx', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    });
+    if (!resp.ok) { showToast('Excel export failed', 'error'); return; }
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'query_results.xlsx';
+    a.click();
+}
+
+function loadFormulaFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const key = params.get('formula');
+    if (key && KPI_FORMULAS[key]) {
+        document.getElementById('sql-editor').value = KPI_FORMULAS[key].sql;
+        const st = document.getElementById('query-status');
+        if (st) st.textContent = 'Loaded formula: ' + KPI_FORMULAS[key].title + ' — click Execute to run';
+    }
+}
+
+async function postProcess() {
+    const op = document.getElementById('pp-operation').value;
+    const rows = currentResults.rows || [];
+    const cols = currentResults.columns || [];
+    if (!rows.length) { showToast('No data to process — run a query first', 'error'); return; }
+
+    const body = { operation: op, columns: cols, rows };
+    if (op === 'group') {
+        body.group_by = document.getElementById('pp-group-by').value;
+        body.agg_func = document.getElementById('pp-agg-func').value;
+        body.value_col = document.getElementById('pp-value').value;
+    } else if (op === 'pivot') {
+        body.index = document.getElementById('pp-group-by').value;
+        body.columns = document.getElementById('pp-pivot-col').value;
+        body.values = document.getElementById('pp-value').value;
+        body.agg_func = document.getElementById('pp-agg-func').value;
+    } else if (op === 'rolling') {
+        body.value_col = document.getElementById('pp-value').value;
+        body.window = parseInt(document.getElementById('pp-window').value || '4', 10);
+        body.order_by = cols[0];
+    } else if (op === 'percentiles') {
+        body.value_col = document.getElementById('pp-value').value;
+    }
+
+    const status = document.getElementById('pp-status');
+    if (status) status.textContent = 'Running pandas ' + op + '...';
+
+    const resp = await fetch('/api/query/postprocess', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    if (data.error) {
+        showToast(data.error, 'error');
+        if (status) status.textContent = 'Error: ' + data.error;
+        return;
+    }
+
+    const resultCols = data.columns || [];
+    const resultRows = data.rows || [];
+    if (status) status.textContent = 'Post-processed via pandas — ' + resultRows.length + ' rows';
+
+    document.getElementById('pp-head').innerHTML = '<tr>' + resultCols.map(c => '<th>' + c + '</th>').join('') + '</tr>';
+    document.getElementById('pp-body').innerHTML = resultRows.map(r =>
+        '<tr>' + resultCols.map(c => '<td>' + (r[c] !== null && r[c] !== undefined ? r[c] : '') + '</td>').join('') + '</tr>'
+    ).join('');
+
+    // Remember the post-processed result for Excel export
+    window.lastPpResult = { columns: resultCols, rows: resultRows };
+}
+
+function togglePpInputs() {
+    const op = document.getElementById('pp-operation').value;
+    const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? '' : 'none'; };
+    show('pp-group-col', ['group','pivot'].includes(op));
+    show('pp-agg-col',   ['group','pivot'].includes(op));
+    show('pp-value-col', ['group','pivot','rolling','percentiles'].includes(op));
+    show('pp-pivot-col', op === 'pivot');
+    show('pp-window-col', op === 'rolling');
+}
+document.getElementById('pp-operation').addEventListener('change', togglePpInputs);
+
+function exportResults() {
+    if (!currentResults.rows || !currentResults.rows.length) { showToast('No results to export', 'error'); return; }
+    const cols = currentResults.columns;
+    const csv = [cols.join(','), ...currentResults.rows.map(r => cols.map(c => '"' + String(r[c] || '').replace(/"/g, '""') + '"').join(','))].join('\n');
+    const blob = new Blob([csv], {type: 'text/csv'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'query_results.csv';
+    a.click();
+}
+
+function showSaveModal() { document.getElementById('save-modal').style.display = 'flex'; }
+function closeSaveModal() { document.getElementById('save-modal').style.display = 'none'; }
+
+async function saveQuery() {
+    const name = document.getElementById('save-name').value.trim();
+    const sql = document.getElementById('sql-editor').value.trim();
+    if (!name || !sql) { showToast('Name and SQL required', 'error'); return; }
+    await fetchApi('/api/query/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, description: document.getElementById('save-desc').value, sql}) });
+    closeSaveModal();
+    showToast('Query saved', 'success');
+    loadSaved();
+}
+
+async function deleteSaved(id) {
+    await fetchApi('/api/query/saved/' + id, { method: 'DELETE' });
+    showToast('Query deleted', 'success');
+    loadSaved();
+}
+
+// Ctrl+Enter to execute
+document.getElementById('sql-editor').addEventListener('keydown', function(e) {
+    if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); executeQuery(); }
+});
+
+loadTemplates();
+loadSaved();
+loadFormulaFromUrl();
+togglePpInputs();
+</script>
+{% endblock %}

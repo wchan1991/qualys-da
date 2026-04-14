@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block title %}Patchable Dashboard - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Patchable Dashboard</h1>
+    <div style="display:flex;gap:8px;align-items:center;">
+        <span style="font-size:12px;color:var(--text-muted);">Scope: Open detections (New/Active/Re-Opened, non-disabled)</span>
+    </div>
+</div>
+
+<!-- Enterprise roll-up cards -->
+<div class="metrics-grid">
+    <div class="metric-card" title="Detections flagged as patchable by Qualys">
+        <div class="metric-value severity-2" id="m-patchable">--</div>
+        <div class="metric-label">Patchable</div>
+    </div>
+    <div class="metric-card" title="Detections with no fix available (config changes / defense-in-depth)">
+        <div class="metric-value severity-3" id="m-non-patchable">--</div>
+        <div class="metric-label">Non-patchable</div>
+    </div>
+    <div class="metric-card" title="Overall patchable %">
+        <div class="metric-value severity-4" id="m-pct">--</div>
+        <div class="metric-label">Overall Patchable %</div>
+    </div>
+    <div class="metric-card" title="Total open detections in scope">
+        <div class="metric-value" id="m-total">--</div>
+        <div class="metric-label">Total Open</div>
+    </div>
+</div>
+
+<!-- Stacked bar: patchable vs non-patchable per severity -->
+<div class="card">
+    <div class="card-header">
+        Patchable vs Non-Patchable by Severity
+        <span style="float:right;font-weight:400;font-size:12px;color:var(--text-muted);">
+            Each bar stacks patchable (green) on non-patchable (gray) for that severity
+        </span>
+    </div>
+    <div class="chart-container" style="height:340px;"><canvas id="chart-patchable"></canvas></div>
+</div>
+
+<!-- Breakdown table -->
+<div class="card">
+    <div class="card-header">Per-Severity Breakdown</div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Severity</th>
+                    <th style="text-align:right;">Patchable</th>
+                    <th style="text-align:right;">Non-Patchable</th>
+                    <th style="text-align:right;">Total</th>
+                    <th style="text-align:right;">Patchable %</th>
+                    <th style="min-width:200px;">Coverage</th>
+                </tr>
+            </thead>
+            <tbody id="patchable-body">
+                <tr><td colspan="6" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text-muted);">
+        Patchable detections have a fix available (vendor patch, package upgrade). Non-patchable require
+        config changes, compensating controls, or have no fix yet.
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let patchableChart = null;
+
+const SEV_LABELS = {1: 'Sev 1 (Minimal)', 2: 'Sev 2 (Low)', 3: 'Sev 3 (Medium)', 4: 'Sev 4 (High)', 5: 'Sev 5 (Urgent)'};
+const SEV_CLASS  = {1: 'badge-low', 2: 'badge-low', 3: 'badge-medium', 4: 'badge-high', 5: 'badge-critical'};
+
+async function loadPatchable() {
+    const data = await fetchApi('/api/patchable-dashboard');
+    if (!data) return;
+
+    const t = data.totals || {};
+    setText('m-patchable',     (t.patchable || 0).toLocaleString());
+    setText('m-non-patchable', (t.non_patchable || 0).toLocaleString());
+    setText('m-pct',           (t.patchable_pct || 0) + '%');
+    setText('m-total',         ((t.patchable || 0) + (t.non_patchable || 0)).toLocaleString());
+
+    // Chart — severities ordered 5..1 for descending-urgency display
+    const sevOrder = [5, 4, 3, 2, 1];
+    const labels = sevOrder.map(s => SEV_LABELS[s]);
+    // data.severities is [1..5], data.patchable/non_patchable arrays match that order
+    const byIdx = (s) => data.severities.indexOf(s);
+    const patchableArr  = sevOrder.map(s => data.patchable[byIdx(s)] || 0);
+    const nonPatchArr   = sevOrder.map(s => data.non_patchable[byIdx(s)] || 0);
+
+    if (patchableChart) patchableChart.destroy();
+    patchableChart = new Chart(document.getElementById('chart-patchable'), {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [
+                { label: 'Patchable',     data: patchableArr, backgroundColor: '#10b981' },
+                { label: 'Non-patchable', data: nonPatchArr,  backgroundColor: '#6b7280' },
+            ],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            indexAxis: 'y',
+            plugins: {
+                legend: { position: 'bottom' },
+                tooltip: {
+                    mode: 'index', intersect: false,
+                    callbacks: {
+                        footer: (items) => {
+                            const total = items.reduce((a, b) => a + b.parsed.x, 0);
+                            const patchable = items.find(i => i.dataset.label === 'Patchable')?.parsed.x || 0;
+                            const pct = total ? (100.0 * patchable / total).toFixed(1) : 0;
+                            return `Total: ${total.toLocaleString()} · ${pct}% patchable`;
+                        },
+                    },
+                },
+            },
+            scales: {
+                x: { stacked: true, beginAtZero: true, title: { display: true, text: 'Open detections' } },
+                y: { stacked: true },
+            },
+        },
+    });
+
+    // Table — already ordered sev5 → sev1 in the API response
+    const body = document.getElementById('patchable-body');
+    const bySev = data.by_severity || [];
+    if (!bySev.length) {
+        body.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px;text-align:center;">No data</td></tr>';
+        return;
+    }
+    body.innerHTML = bySev.map(r => {
+        const pct = r.pct || 0;
+        const barColor = pct >= 70 ? '#10b981' : pct >= 40 ? '#f59e0b' : '#ef4444';
+        return `<tr>
+            <td><span class="badge ${SEV_CLASS[r.severity]}">${SEV_LABELS[r.severity]}</span></td>
+            <td style="text-align:right;">${(r.patchable || 0).toLocaleString()}</td>
+            <td style="text-align:right;">${(r.non_patchable || 0).toLocaleString()}</td>
+            <td style="text-align:right;"><strong>${(r.total || 0).toLocaleString()}</strong></td>
+            <td style="text-align:right;"><strong>${pct}%</strong></td>
+            <td>
+              <div style="background:var(--bg-tertiary);border-radius:3px;overflow:hidden;height:14px;position:relative;">
+                <div style="background:${barColor};height:100%;width:${pct}%;transition:width 0.3s;"></div>
+              </div>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+loadPatchable();
+</script>
+{% endblock %}

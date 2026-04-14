@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+{% block title %}Host Browser - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Host Browser</h1>
+    <div style="display:flex;gap:8px;">
+        <input type="text" id="host-search" placeholder="Search by IP or hostname..." style="padding:6px 12px;border-radius:6px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);min-width:250px;" onkeydown="if(event.key==='Enter')searchHosts()">
+        <button class="btn btn-primary" onclick="searchHosts()">Search</button>
+        <button class="btn" onclick="window.location='/api/export/csv?type=hosts'">Export CSV</button>
+    </div>
+</div>
+
+<!-- Coverage Summary -->
+<div class="metrics-grid" id="coverage-metrics">
+    <div class="metric-card"><div class="metric-value" id="h-total">--</div><div class="metric-label">Total Hosts</div></div>
+    <div class="metric-card"><div class="metric-value" id="h-both">--</div><div class="metric-label">Both Sources</div></div>
+    <div class="metric-card"><div class="metric-value" id="h-vm-only">--</div><div class="metric-label">VM Only</div></div>
+    <div class="metric-card"><div class="metric-value" id="h-csam-only">--</div><div class="metric-label">CSAM Only</div></div>
+    <div class="metric-card"><div class="metric-value" id="h-coverage">--</div><div class="metric-label">Coverage %</div></div>
+</div>
+
+<!-- Host List -->
+<div class="card">
+    <div class="card-header">Hosts <span id="host-count"></span></div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th onclick="sortHosts('ip_address')">IP Address</th>
+                    <th onclick="sortHosts('dns')">Hostname</th>
+                    <th onclick="sortHosts('os')">OS</th>
+                    <th onclick="sortHosts('trurisk_score')">TruRisk</th>
+                    <th onclick="sortHosts('last_scan_date')">Last Scan</th>
+                    <th>Sources</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="host-table"></tbody>
+        </table>
+    </div>
+    <div class="pagination" id="host-pagination"></div>
+</div>
+
+<!-- Host Detail Panel -->
+<div id="host-detail" style="display:none;">
+    <div class="card" style="margin-top:16px;">
+        <div class="card-header">Host Detail: <span id="detail-ip">--</span></div>
+        <div class="metrics-grid" id="detail-metrics"></div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
+            <div>
+                <h3 style="margin-bottom:8px;">VM Host Info</h3>
+                <table class="data-table" id="vm-info"></table>
+            </div>
+            <div>
+                <h3 style="margin-bottom:8px;">CSAM Asset Info</h3>
+                <table class="data-table" id="csam-info"></table>
+            </div>
+        </div>
+
+        <h3 style="margin:16px 0 8px;">Tags</h3>
+        <div id="detail-tags" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+
+        <h3 style="margin:16px 0 8px;">Detections</h3>
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead>
+                    <tr><th>QID</th><th>Severity</th><th>Status</th><th>Type</th><th>QDS</th><th>First Found</th><th>Last Found</th></tr>
+                </thead>
+                <tbody id="detail-detections"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let hostData = [];
+let currentPage = 1;
+const perPage = 100;
+
+async function loadCoverage() {
+    const data = await fetchApi('/api/metrics/asset-coverage');
+    if (!data) return;
+    setText('h-total', (data.total_unique_ips || 0).toLocaleString());
+    setText('h-both', (data.both || 0).toLocaleString());
+    setText('h-vm-only', (data.vm_only || 0).toLocaleString());
+    setText('h-csam-only', (data.csam_only || 0).toLocaleString());
+    setText('h-coverage', (data.coverage_pct || 0) + '%');
+}
+
+async function searchHosts() {
+    const q = document.getElementById('host-search').value;
+    let url = '/api/hosts?per_page=' + perPage + '&page=' + currentPage;
+    if (q) url += '&ip=' + encodeURIComponent(q);
+    const data = await fetchApi(url);
+    if (!data) return;
+    hostData = data;
+    renderHosts();
+}
+
+function renderHosts() {
+    document.getElementById('host-count').textContent = '(' + hostData.length + ' rows)';
+    document.getElementById('host-table').innerHTML = hostData.map(h => {
+        // These rows come from vm_hosts — always VM source, CSAM checked on detail
+        return `<tr>
+            <td><a href="#" onclick="loadDetail('${h.ip_address}');return false;">${h.ip_address || ''}</a></td>
+            <td>${h.dns || h.netbios || ''}</td>
+            <td>${h.os || ''}</td>
+            <td>${h.trurisk_score || 0}</td>
+            <td>${(h.last_scan_date || '').slice(0,10)}</td>
+            <td><span class="badge badge-low">VM</span></td>
+            <td><button class="btn btn-sm" onclick="loadDetail('${h.ip_address}')">Detail</button></td>
+        </tr>`;
+    }).join('');
+}
+
+function sortHosts(key) {
+    hostData.sort((a, b) => {
+        const va = a[key] || '', vb = b[key] || '';
+        return typeof va === 'number' ? vb - va : String(va).localeCompare(String(vb));
+    });
+    renderHosts();
+}
+
+async function loadDetail(ip) {
+    const data = await fetchApi('/api/host/' + encodeURIComponent(ip));
+    if (!data) return;
+    document.getElementById('host-detail').style.display = '';
+    document.getElementById('detail-ip').textContent = ip;
+
+    const vm = data.vm_host || {};
+    const csam = data.csam || {};
+    const det = data.detections || [];
+
+    document.getElementById('detail-metrics').innerHTML = `
+        <div class="metric-card"><div class="metric-value">${vm.trurisk_score || 0}</div><div class="metric-label">TruRisk</div></div>
+        <div class="metric-card"><div class="metric-value">${det.length}</div><div class="metric-label">Detections</div></div>
+        <div class="metric-card"><div class="metric-value severity-5">${det.filter(d=>d.severity>=5).length}</div><div class="metric-label">Sev 5</div></div>
+        <div class="metric-card"><div class="metric-value severity-4">${det.filter(d=>d.severity>=4&&d.severity<5).length}</div><div class="metric-label">Sev 4</div></div>
+    `;
+
+    document.getElementById('vm-info').innerHTML = vm.host_id ? `
+        <tr><td>Host ID</td><td>${vm.host_id}</td></tr>
+        <tr><td>DNS</td><td>${vm.dns || '-'}</td></tr>
+        <tr><td>NetBIOS</td><td>${vm.netbios || '-'}</td></tr>
+        <tr><td>OS</td><td>${vm.os || '-'}</td></tr>
+        <tr><td>Tracking</td><td>${vm.tracking_method || '-'}</td></tr>
+        <tr><td>Last Scan</td><td>${(vm.last_scan_date || '').slice(0,10)}</td></tr>
+    ` : '<tr><td colspan="2" style="text-align:center;color:var(--text-muted)">No VM data</td></tr>';
+
+    document.getElementById('csam-info').innerHTML = csam.asset_id ? `
+        <tr><td>Asset ID</td><td>${csam.asset_id}</td></tr>
+        <tr><td>Name</td><td>${csam.name || '-'}</td></tr>
+        <tr><td>OS</td><td>${csam.os || '-'}</td></tr>
+        <tr><td>Hardware</td><td>${csam.hardware || '-'}</td></tr>
+        <tr><td>Last Seen</td><td>${(csam.last_seen || '').slice(0,10)}</td></tr>
+    ` : '<tr><td colspan="2" style="text-align:center;color:var(--text-muted)">No CSAM data</td></tr>';
+
+    const tags = data.tags || [];
+    document.getElementById('detail-tags').innerHTML = tags.length
+        ? tags.map(t => `<span class="badge badge-low" style="cursor:pointer" onclick="window.location='/tags'">${t.tag_name}</span>`).join('')
+        : '<span style="color:var(--text-muted)">No tags</span>';
+
+    document.getElementById('detail-detections').innerHTML = det.map(d => `<tr>
+        <td>${d.qid}</td>
+        <td class="severity-${d.severity}">${d.severity}</td>
+        <td>${d.status}</td>
+        <td>${d.detection_type || ''}</td>
+        <td>${d.qds || ''}</td>
+        <td>${(d.first_found || '').slice(0,10)}</td>
+        <td>${(d.last_found || '').slice(0,10)}</td>
+    </tr>`).join('');
+
+    document.getElementById('host-detail').scrollIntoView({behavior: 'smooth'});
+}
+
+// Check URL params for direct IP lookup
+const urlParams = new URLSearchParams(window.location.search);
+const ipParam = urlParams.get('ip');
+if (ipParam) {
+    document.getElementById('host-search').value = ipParam;
+    searchHosts().then(() => loadDetail(ipParam));
+} else {
+    searchHosts();
+}
+loadCoverage();
+</script>
+{% endblock %}

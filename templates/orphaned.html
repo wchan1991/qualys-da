@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}Orphaned Assets - Qualys DA{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Orphaned Assets</h1>
+    <div style="display:flex;gap:8px;align-items:center;">
+        <button class="btn" onclick="exportOrphans()">Export CSV</button>
+    </div>
+</div>
+
+<div class="metrics-grid">
+    <div class="metric-card" title="Hosts (CSAM ∪ VM) that match no ownership rule">
+        <div class="metric-value severity-5" id="m-orphan-count">--</div>
+        <div class="metric-label">Orphaned Hosts</div>
+    </div>
+    <div class="metric-card" title="Total hosts across CSAM + VM">
+        <div class="metric-value" id="m-total">--</div>
+        <div class="metric-label">Total Hosts</div>
+    </div>
+    <div class="metric-card" title="% of estate without an owner">
+        <div class="metric-value severity-4" id="m-pct">--</div>
+        <div class="metric-label">Orphan %</div>
+    </div>
+    <a class="metric-card" href="/ownership" title="Fix this: add ownership rules">
+        <div class="metric-value severity-3" id="m-vulns">--</div>
+        <div class="metric-label">Open Vulns on Orphans</div>
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        Hosts With No Owner
+        <span style="float:right;font-weight:400;font-size:12px;color:var(--text-muted);">
+            Sorted by open vulns, then TruRisk &mdash; highest risk first
+        </span>
+    </div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>IP</th>
+                    <th>Hostname</th>
+                    <th>OS</th>
+                    <th>Source</th>
+                    <th style="text-align:right;">TruRisk</th>
+                    <th style="text-align:right;">Open Vulns</th>
+                    <th>Last Scan</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody id="orphan-body">
+                <tr><td colspan="8" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text-muted);">
+        An asset is orphaned when no rule in <a href="/ownership">Ownership Manager</a> matches its IP,
+        tags, or OS. Add a rule to claim these hosts.
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentOrphans = [];
+
+function sourceBadge(info) {
+    const both = info.in_csam && info.in_vm;
+    if (both) return '<span class="badge badge-low" title="In CSAM + VM">CSAM + VM</span>';
+    if (info.in_vm) return '<span class="badge badge-medium" title="VM only">VM only</span>';
+    return '<span class="badge badge-high" title="CSAM only — never scanned">CSAM only</span>';
+}
+
+function fmtDate(d) {
+    if (!d) return '<span style="color:var(--text-muted);">—</span>';
+    return d.substring(0, 10);
+}
+
+async function loadOrphans() {
+    const data = await fetchApi('/api/orphaned');
+    if (!data) return;
+    currentOrphans = data.orphans || [];
+
+    const total = data.total_hosts || 0;
+    const orphanCount = data.total || 0;
+    setText('m-orphan-count', orphanCount.toLocaleString());
+    setText('m-total',        total.toLocaleString());
+    setText('m-pct',          total ? ((orphanCount / total * 100).toFixed(1) + '%') : '0%');
+    const vulnSum = currentOrphans.reduce((a, h) => a + (h.open_vulns || 0), 0);
+    setText('m-vulns',        vulnSum.toLocaleString());
+
+    const body = document.getElementById('orphan-body');
+    if (!currentOrphans.length) {
+        body.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);padding:20px;text-align:center;">No orphaned hosts 🎉 — every asset matches an ownership rule.</td></tr>';
+        return;
+    }
+    body.innerHTML = currentOrphans.map(h => `<tr>
+        <td><a href="/hosts?ip=${encodeURIComponent(h.ip_address || '')}"><strong>${h.ip_address || '?'}</strong></a></td>
+        <td style="font-size:12px;">${h.dns || '<span style="color:var(--text-muted);">—</span>'}</td>
+        <td style="font-size:12px;color:var(--text-secondary);">${h.os || ''}</td>
+        <td>${sourceBadge(h)}</td>
+        <td style="text-align:right;">${h.trurisk_score != null ? h.trurisk_score : '<span style="color:var(--text-muted);">—</span>'}</td>
+        <td style="text-align:right;"><strong>${(h.open_vulns || 0).toLocaleString()}</strong></td>
+        <td style="font-size:12px;">${fmtDate(h.last_scan_date)}</td>
+        <td>
+          <a class="btn btn-sm" href="/ownership?match_type=ip&match_value=${encodeURIComponent(h.ip_address || '')}" title="Open Ownership Manager prefilled with this IP">Assign owner</a>
+        </td>
+    </tr>`).join('');
+}
+
+function exportOrphans() {
+    if (!currentOrphans.length) { showToast('No orphans to export', 'error'); return; }
+    const header = ['IP', 'Hostname', 'OS', 'Source', 'TruRisk', 'Open Vulns', 'Last Scan'];
+    const rows = currentOrphans.map(h => {
+        const source = (h.in_csam && h.in_vm) ? 'CSAM+VM' : h.in_vm ? 'VM only' : 'CSAM only';
+        return [h.ip_address, h.dns, h.os, source,
+                h.trurisk_score ?? '', h.open_vulns || 0, (h.last_scan_date || '').substring(0, 10)
+        ].map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',');
+    });
+    const csv = [header.join(','), ...rows].join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+    a.download = 'orphaned_assets.csv';
+    a.click();
+}
+
+loadOrphans();
+</script>
+{% endblock %}

@@ -1,0 +1,894 @@
+{% extends "base.html" %}
+{% block title %}Cyber 6-Pack - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Cyber 6-Pack</h1>
+    <div style="display:flex;gap:8px;">
+        <select id="group-by" class="btn" onchange="loadSixPack()">
+            <option value="owner">Group by Owner</option>
+            <option value="tag">Group by Tag</option>
+            <option value="os">Group by OS</option>
+        </select>
+        <button class="btn" onclick="exportSixPack()">Export CSV</button>
+    </div>
+</div>
+
+<!-- Enterprise Summary -->
+<div class="card">
+    <div class="card-header">Enterprise Summary</div>
+    <div class="metrics-grid" id="enterprise-metrics">
+        <div class="metric-card"><div class="metric-value" id="e-avg-age">--</div><div class="metric-label">Weighted Avg Age (days)</div></div>
+        <div class="metric-card"><div class="metric-value" id="e-total-vulns">--</div><div class="metric-label">Total Vulns</div></div>
+        <div class="metric-card"><div class="metric-value" id="e-breaching">--</div><div class="metric-label">SLA Breaching</div></div>
+        <div class="metric-card"><div class="metric-value" id="e-compliance">--</div><div class="metric-label">SLA Compliance %</div></div>
+    </div>
+</div>
+
+<!-- Per-Group Table -->
+<div class="card">
+    <div class="card-header">Per-Group Breakdown</div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Group</th>
+                    <th>Total Vulns</th>
+                    <th>Weighted Avg Age</th>
+                    <th>SLA Breaching</th>
+                    <th>SLA Compliance %</th>
+                    <th>Avg TruRisk</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="group-table"></tbody>
+        </table>
+    </div>
+</div>
+
+<div class="chart-row">
+    <div class="card">
+        <div class="card-header">Vulnerability Count by Group</div>
+        <div class="chart-container"><canvas id="chart-group-vulns"></canvas></div>
+    </div>
+    <div class="card">
+        <div class="card-header">SLA Compliance by Group</div>
+        <div class="chart-container"><canvas id="chart-group-sla"></canvas></div>
+    </div>
+</div>
+
+<!-- Month-over-month Breakdown -->
+<div class="chart-row">
+    <div class="card">
+        <div class="card-header">Avg Vuln Age — Month-over-Month</div>
+        <div class="chart-container"><canvas id="chart-trend-age"></canvas></div>
+    </div>
+    <div class="card">
+        <div class="card-header">SLA Breaches — Month-over-Month</div>
+        <div class="chart-container"><canvas id="chart-trend-sla"></canvas></div>
+    </div>
+</div>
+
+<!-- Month-over-month Matrix (per group × month) -->
+<div class="card">
+    <div class="card-header">
+        Month-over-Month Matrix
+        <span style="float:right;display:flex;gap:8px;align-items:center;font-weight:400;">
+            <span style="font-size:12px;color:var(--text-muted);">Metric:</span>
+            <select id="matrix-metric" class="btn btn-sm" style="padding:4px 10px;">
+                <option value="avg_age">Avg Age (days)</option>
+                <option value="sla_breaches">SLA Breaches</option>
+            </select>
+            <button class="btn btn-sm" onclick="exportMatrix()">Export CSV</button>
+        </span>
+    </div>
+    <div class="table-wrapper">
+        <table class="data-table" id="matrix-table">
+            <thead id="matrix-head"></thead>
+            <tbody id="matrix-body"></tbody>
+        </table>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text-muted);">
+        Cells shaded by value within each column (darker = worse).
+        Rightmost columns are most recent months.
+    </div>
+</div>
+
+<!-- Combined Matrix: Total Vulns + Avg Age per group per month -->
+<div class="card">
+    <div class="card-header">
+        Total Vulns &amp; Avg Age — Month-over-Month
+        <span style="float:right;font-weight:400;">
+            <button class="btn btn-sm" onclick="exportCombinedMatrix()">Export CSV</button>
+        </span>
+    </div>
+    <div class="table-wrapper">
+        <table class="data-table" id="combined-matrix-table">
+            <thead id="combined-matrix-head"></thead>
+            <tbody id="combined-matrix-body"></tbody>
+        </table>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text-muted);">
+        Each cell shows <strong>vuln count</strong> on top and <strong>avg age (days)</strong> below.
+        Shading reflects vuln count relative to the column max. Hover a cell to see the raw values.
+    </div>
+</div>
+
+<!-- Waterfall (new vs fixed vs reopened) -->
+<div class="card">
+    <div class="card-header">
+        Vulnerability Waterfall &mdash; New vs Fixed vs Re-opened
+        <span style="float:right;font-weight:400;font-size:13px;display:flex;gap:8px;align-items:center;">
+            <span style="color:var(--text-muted);font-size:12px;">View:</span>
+            <select id="waterfall-view" class="btn btn-sm" style="padding:4px 10px;" title="Lifecycle = single 5-bar window decomposition · Monthly = one stacked bar per month">
+                <option value="lifecycle" selected>Lifecycle (5 bars)</option>
+                <option value="monthly">Monthly deltas</option>
+            </select>
+            <span style="color:var(--text-muted);font-size:12px;">Window:</span>
+            <select id="waterfall-months" class="btn btn-sm" style="padding:4px 10px;">
+                <option value="1">Last 1 month</option>
+                <option value="3">Last 3 months</option>
+                <option value="6">Last 6 months</option>
+                <option value="9">Last 9 months</option>
+                <option value="12" selected>Last 12 months</option>
+            </select>
+            <span style="color:var(--text-muted);font-size:12px;">Scope:</span>
+            <select id="waterfall-owner" class="btn btn-sm" style="padding:4px 10px;">
+                <option value="">All ownership (enterprise)</option>
+            </select>
+        </span>
+    </div>
+    <div id="waterfall-range" style="margin:6px 0 0;padding:6px 10px;background:var(--bg-tertiary);border-radius:4px;font-size:12px;color:var(--text-secondary);text-align:center;font-weight:500;">Loading window…</div>
+    <div class="chart-container" style="height:340px;"><canvas id="chart-waterfall"></canvas></div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text-muted);display:flex;flex-wrap:wrap;gap:14px;align-items:center;">
+        <span style="display:inline-flex;align-items:center;gap:5px;"><span style="width:10px;height:10px;background:#475569;border-radius:2px;display:inline-block;"></span>Last Period (Active)</span>
+        <span style="display:inline-flex;align-items:center;gap:5px;"><span style="width:10px;height:10px;background:#ef4444;border-radius:2px;display:inline-block;"></span>New (first_found in window)</span>
+        <span style="display:inline-flex;align-items:center;gap:5px;"><span style="width:10px;height:10px;background:#f59e0b;border-radius:2px;display:inline-block;"></span>Re-opened</span>
+        <span style="display:inline-flex;align-items:center;gap:5px;"><span style="width:10px;height:10px;background:#10b981;border-radius:2px;display:inline-block;"></span>Fixed</span>
+        <span style="display:inline-flex;align-items:center;gap:5px;"><span style="width:10px;height:10px;background:#1e40af;border-radius:2px;display:inline-block;"></span>Current (Active)</span>
+        <span style="flex:1;min-width:120px;text-align:right;">Bars stack: <strong>Last + New + Re-opened &minus; Fixed = Current</strong></span>
+        <span id="waterfall-warning" style="display:none;color:var(--severity-4);width:100%;"></span>
+    </div>
+</div>
+
+<!-- OS vs Ownership stacked bar -->
+<div class="card">
+    <div class="card-header">
+        Operating System Vulns by Ownership
+        <span style="float:right;font-weight:400;font-size:12px;color:var(--text-muted);">
+            Open detections (non-disabled) grouped by OS family
+        </span>
+    </div>
+    <div class="chart-container" style="height:320px;"><canvas id="chart-os-ownership"></canvas></div>
+</div>
+
+<!-- CVE by Ownership matrix -->
+<div class="card">
+    <div class="card-header">
+        CVEs by Ownership
+        <span style="float:right;font-weight:400;font-size:13px;">
+            <span id="cve-enterprise-totals" style="color:var(--text-muted);margin-right:12px;"></span>
+            <button class="btn btn-sm" onclick="exportCveMatrix()">Export CSV</button>
+        </span>
+    </div>
+    <div class="table-wrapper">
+        <table class="data-table" id="cve-matrix-table">
+            <thead>
+                <tr>
+                    <th style="position:sticky;left:0;background:var(--bg-secondary);z-index:1;">Group</th>
+                    <th style="text-align:right;">Hosts</th>
+                    <th style="text-align:right;">Distinct CVEs</th>
+                    <th style="text-align:right;">Critical<br><small style="font-weight:400;color:var(--text-muted);">CVSS 9.0+</small></th>
+                    <th style="text-align:right;">High<br><small style="font-weight:400;color:var(--text-muted);">7.0–8.9</small></th>
+                    <th style="text-align:right;">Medium<br><small style="font-weight:400;color:var(--text-muted);">4.0–6.9</small></th>
+                    <th style="text-align:right;">Low<br><small style="font-weight:400;color:var(--text-muted);">0.1–3.9</small></th>
+                    <th style="text-align:right;">Max CVSS</th>
+                    <th style="text-align:right;">Avg TruRisk</th>
+                    <th>Top Critical CVE<br><small style="font-weight:400;color:var(--text-muted);">Most prevalent CVSS 9.0+</small></th>
+                    <th style="text-align:right;">Affected Hosts</th>
+                </tr>
+            </thead>
+            <tbody id="cve-matrix-body">
+                <tr><td colspan="11" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--text-muted);">
+        Counts are OPEN detections (New/Active/Re-Opened, not disabled). Band shading reflects the
+        per-column maximum. Click a group's Top CVE to pivot to Query Builder for that CVE.
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let vulnChart, slaChart, trendAgeChart, trendSlaChart;
+let currentTrendData = { months: [], groups: [] };
+
+// 8 readable line colors for month-over-month charts
+const TREND_COLORS = ['#3b82f6','#ef4444','#10b981','#f59e0b','#8b5cf6','#ec4899','#14b8a6','#64748b'];
+
+// Format 'YYYY-MM' -> 'MMM YYYY' (e.g. '2025-05' -> 'MAY 2025')
+const MONTH_ABBR = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+function fmtMonth(ym) {
+    if (!ym || typeof ym !== 'string') return ym;
+    const parts = ym.split('-');
+    if (parts.length < 2) return ym;
+    const idx = parseInt(parts[1], 10) - 1;
+    if (idx < 0 || idx > 11) return ym;
+    return MONTH_ABBR[idx] + ' ' + parts[0];
+}
+
+async function loadSixPack() {
+    const groupBy = document.getElementById('group-by').value;
+    const data = await fetchApi('/api/six-pack?group_by=' + groupBy);
+    if (!data) return;
+
+    const ent = data.enterprise || {};
+    setText('e-avg-age', ent.weighted_avg_age || 0);
+    setText('e-total-vulns', (ent.total_vulns || 0).toLocaleString());
+    setText('e-breaching', (ent.sla_breaching || 0).toLocaleString());
+    setText('e-compliance', (ent.sla_compliance_pct || 0) + '%');
+
+    const groups = data.groups || [];
+    document.getElementById('group-table').innerHTML = groups.map(g => {
+        const slaClass = g.sla_compliance_pct >= 90 ? 'sla-good' : g.sla_compliance_pct >= 70 ? 'sla-warning' : 'sla-breach';
+        return `<tr>
+            <td><strong>${g.name || 'Unknown'}</strong>${g.business_unit ? '<br><small style="color:var(--text-muted)">' + g.business_unit + '</small>' : ''}</td>
+            <td>${(g.total_vulns||0).toLocaleString()}</td>
+            <td>${g.weighted_avg_age || 0} days</td>
+            <td class="${slaClass}">${(g.sla_breaching||0).toLocaleString()}</td>
+            <td class="${slaClass}">${g.sla_compliance_pct || 0}%</td>
+            <td>${g.avg_trurisk != null ? Math.round(g.avg_trurisk).toLocaleString() : '<span style="color:var(--text-muted);">—</span>'}</td>
+            <td><span class="badge ${slaClass === 'sla-good' ? 'badge-low' : slaClass === 'sla-warning' ? 'badge-medium' : 'badge-critical'}">${slaClass === 'sla-good' ? 'Good' : slaClass === 'sla-warning' ? 'Warning' : 'Breach'}</span></td>
+        </tr>`;
+    }).join('');
+
+    // Charts
+    if (vulnChart) vulnChart.destroy();
+    if (slaChart) slaChart.destroy();
+    if (groups.length) {
+        vulnChart = new Chart(document.getElementById('chart-group-vulns'), {
+            type: 'bar',
+            data: { labels: groups.map(g=>g.name||'?'), datasets: [{data: groups.map(g=>g.total_vulns||0), backgroundColor: '#ef4444', borderRadius: 4}] },
+            options: { indexAxis: 'y', responsive: true, plugins: {legend:{display:false}} }
+        });
+        slaChart = new Chart(document.getElementById('chart-group-sla'), {
+            type: 'bar',
+            data: { labels: groups.map(g=>g.name||'?'), datasets: [{data: groups.map(g=>g.sla_compliance_pct||0), backgroundColor: groups.map(g => g.sla_compliance_pct >= 90 ? '#10b981' : g.sla_compliance_pct >= 70 ? '#f59e0b' : '#ef4444'), borderRadius: 4}] },
+            options: { indexAxis: 'y', responsive: true, plugins: {legend:{display:false}}, scales: {x:{max:100}} }
+        });
+    }
+}
+
+async function loadSixPackTrend() {
+    const groupBy = document.getElementById('group-by').value;
+    const data = await fetchApi('/api/six-pack/trend?group_by=' + groupBy + '&months=12');
+    if (!data) return;
+    const months = data.months || [];
+    const groups = data.groups || [];
+
+    if (trendAgeChart) trendAgeChart.destroy();
+    if (trendSlaChart) trendSlaChart.destroy();
+    if (!months.length || !groups.length) return;
+
+    // Avg Age: grouped bars — one bar per ownership group within each month.
+    const ageDatasets = groups.map((g, i) => ({
+        label: g.name,
+        data: g.avg_age,
+        backgroundColor: TREND_COLORS[i % TREND_COLORS.length],
+        borderColor: TREND_COLORS[i % TREND_COLORS.length],
+        borderWidth: 1,
+        borderRadius: 3,
+    }));
+    // SLA breaches stays a line chart for readability.
+    const slaDatasets = groups.map((g, i) => ({
+        label: g.name,
+        data: g.sla_breaches,
+        borderColor: TREND_COLORS[i % TREND_COLORS.length],
+        backgroundColor: TREND_COLORS[i % TREND_COLORS.length] + '20',
+        tension: 0.3,
+        fill: false,
+    }));
+
+    const monthLabels = months.map(fmtMonth);
+    trendAgeChart = new Chart(document.getElementById('chart-trend-age'), {
+        type: 'bar',
+        data: { labels: monthLabels, datasets: ageDatasets },
+        options: {
+            responsive: true,
+            plugins: {
+                legend: { position: 'bottom' },
+                tooltip: { mode: 'index', intersect: false },
+            },
+            scales: {
+                x: { grid: { display: false } },
+                y: { beginAtZero: true, title: { display: true, text: 'Avg age (days)' } },
+            },
+            // Tighten spacing so many month × group combinations stay readable.
+            categoryPercentage: 0.85,
+            barPercentage: 0.95,
+        }
+    });
+    trendSlaChart = new Chart(document.getElementById('chart-trend-sla'), {
+        type: 'line',
+        data: { labels: monthLabels, datasets: slaDatasets },
+        options: { responsive: true, plugins: {legend:{position:'bottom'}}, scales: {y:{beginAtZero:true, title:{display:true,text:'SLA breaches'}}} }
+    });
+
+    // Keep trend data + render matrices
+    currentTrendData = { months, groups };
+    renderMatrix();
+    renderCombinedMatrix();
+}
+
+function renderCombinedMatrix() {
+    const { months, groups } = currentTrendData;
+    const head = document.getElementById('combined-matrix-head');
+    const body = document.getElementById('combined-matrix-body');
+    if (!months.length || !groups.length) {
+        head.innerHTML = '';
+        body.innerHTML = '<tr><td style="color:var(--text-muted);padding:20px;text-align:center;">No trend data</td></tr>';
+        return;
+    }
+
+    // Shade by vuln count (column-wise max)
+    const colMax = months.map((_, ci) => Math.max(0, ...groups.map(g => (g.total_vulns || [])[ci] || 0)));
+
+    head.innerHTML = '<tr><th style="position:sticky;left:0;background:var(--bg-tertiary);">Group</th>' +
+        months.map(m => `<th style="text-align:center;">${fmtMonth(m)}</th>`).join('') +
+        '<th style="text-align:center;">Total</th></tr>';
+
+    body.innerHTML = groups.map(g => {
+        const counts = g.total_vulns || [];
+        const ages = g.avg_age || [];
+        const totalSum = counts.reduce((a, b) => a + (b || 0), 0);
+        const avgAgeOverall = ages.length
+            ? (ages.reduce((a, b) => a + (b || 0), 0) / ages.filter(v => v > 0).length || 0)
+            : 0;
+        const cells = counts.map((c, ci) => {
+            const max = colMax[ci] || 1;
+            const ratio = Math.min(1, (c || 0) / max);
+            const hue = 120 - Math.round(ratio * 120);
+            const bg = `hsla(${hue}, 70%, 50%, ${0.12 + ratio * 0.5})`;
+            const age = ages[ci] || 0;
+            const countDisp = (c || 0).toLocaleString();
+            const ageDisp = age ? age.toFixed(1) + 'd' : '—';
+            const tip = `${countDisp} vulns · ${age ? age.toFixed(1) + ' day avg age' : 'no data'}`;
+            return `<td style="text-align:center;background:${bg};font-variant-numeric:tabular-nums;line-height:1.2;" title="${tip}">
+                <div style="font-weight:600;">${countDisp}</div>
+                <div style="font-size:11px;color:var(--text-secondary);">${ageDisp}</div>
+            </td>`;
+        }).join('');
+        return `<tr>
+            <td style="position:sticky;left:0;background:var(--bg-primary);font-weight:600;white-space:nowrap;">${g.name}</td>
+            ${cells}
+            <td style="text-align:center;font-weight:600;border-left:1px solid var(--border-color);line-height:1.2;">
+                <div>${totalSum.toLocaleString()}</div>
+                <div style="font-size:11px;color:var(--text-secondary);">${avgAgeOverall ? avgAgeOverall.toFixed(1) + 'd' : '—'}</div>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+function exportCombinedMatrix() {
+    const { months, groups } = currentTrendData;
+    if (!months.length || !groups.length) { showToast('No matrix data to export', 'error'); return; }
+    // Two rows per month header: count + age
+    const header = ['Group'];
+    months.forEach(m => { header.push(`${fmtMonth(m)} Vulns`, `${fmtMonth(m)} Avg Age (days)`); });
+    header.push('Total Vulns', 'Overall Avg Age (days)');
+    const rows = groups.map(g => {
+        const counts = g.total_vulns || [];
+        const ages = g.avg_age || [];
+        const cells = [`"${g.name.replace(/"/g, '""')}"`];
+        months.forEach((_, ci) => {
+            cells.push(counts[ci] || 0);
+            cells.push((ages[ci] || 0).toFixed(1));
+        });
+        const totalSum = counts.reduce((a, b) => a + (b || 0), 0);
+        const agesNonZero = ages.filter(v => v > 0);
+        const avgAge = agesNonZero.length ? agesNonZero.reduce((a, b) => a + b, 0) / agesNonZero.length : 0;
+        cells.push(totalSum, avgAge.toFixed(1));
+        return cells.join(',');
+    });
+    const csv = [header.join(','), ...rows].join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+    a.download = 'six_pack_combined_matrix.csv';
+    a.click();
+}
+
+function renderMatrix() {
+    const metric = document.getElementById('matrix-metric').value;
+    const { months, groups } = currentTrendData;
+    const head = document.getElementById('matrix-head');
+    const body = document.getElementById('matrix-body');
+    if (!months.length || !groups.length) {
+        head.innerHTML = ''; body.innerHTML = '<tr><td style="color:var(--text-muted);padding:20px;text-align:center;">No trend data</td></tr>';
+        return;
+    }
+
+    // Column-wise min/max to shade cells relative to that month's spread
+    const colMax = months.map((_, ci) => Math.max(0, ...groups.map(g => g[metric][ci] || 0)));
+
+    // Build header
+    head.innerHTML = '<tr><th style="position:sticky;left:0;background:var(--bg-tertiary);">Group</th>' +
+        months.map(m => `<th style="text-align:right;">${fmtMonth(m)}</th>`).join('') +
+        '<th style="text-align:right;">Avg</th></tr>';
+
+    // Build rows
+    body.innerHTML = groups.map(g => {
+        const vals = g[metric] || [];
+        const avg = vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+        const cells = vals.map((v, ci) => {
+            const max = colMax[ci] || 1;
+            const ratio = Math.min(1, (v || 0) / max);
+            // Green (low) → amber → red (high). Alpha scales with ratio for readability.
+            const hue = 120 - Math.round(ratio * 120); // 120=green, 60=amber, 0=red
+            const bg = `hsla(${hue}, 70%, 50%, ${0.12 + ratio * 0.5})`;
+            const display = metric === 'avg_age'
+                ? (v ? v.toFixed(1) : '0')
+                : (v || 0).toLocaleString();
+            return `<td style="text-align:right;background:${bg};font-variant-numeric:tabular-nums;">${display}</td>`;
+        }).join('');
+        const avgDisplay = metric === 'avg_age' ? avg.toFixed(1) : Math.round(avg).toLocaleString();
+        return `<tr>
+            <td style="position:sticky;left:0;background:var(--bg-primary);font-weight:600;white-space:nowrap;">${g.name}</td>
+            ${cells}
+            <td style="text-align:right;font-weight:600;border-left:1px solid var(--border-color);">${avgDisplay}</td>
+        </tr>`;
+    }).join('');
+}
+
+function exportMatrix() {
+    const metric = document.getElementById('matrix-metric').value;
+    const { months, groups } = currentTrendData;
+    if (!months.length || !groups.length) { showToast('No matrix data to export', 'error'); return; }
+    const header = ['Group', ...months.map(fmtMonth), 'Avg'].join(',');
+    const rows = groups.map(g => {
+        const vals = g[metric] || [];
+        const avg = vals.length ? (vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+        return [`"${g.name.replace(/"/g, '""')}"`, ...vals.map(v => v || 0), avg.toFixed(2)].join(',');
+    });
+    const csv = [header, ...rows].join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+    a.download = `six_pack_matrix_${metric}.csv`;
+    a.click();
+}
+
+document.getElementById('matrix-metric').addEventListener('change', renderMatrix);
+
+let currentCveData = { groups: [], enterprise: {} };
+
+async function loadCveMatrix() {
+    const groupBy = document.getElementById('group-by').value;
+    const data = await fetchApi('/api/six-pack/cve?group_by=' + groupBy);
+    if (!data) return;
+    currentCveData = data;
+    renderCveMatrix();
+}
+
+function cellShade(value, max, baseHue) {
+    // Column-wise HSL fill: darker/more-saturated for higher values.
+    if (!max || value == null) return '';
+    const ratio = Math.min(1, value / max);
+    if (ratio <= 0) return '';
+    return `background-color: hsla(${baseHue}, 70%, 50%, ${0.08 + ratio * 0.55});`;
+}
+
+function renderCveMatrix() {
+    const { groups, enterprise } = currentCveData;
+    const body = document.getElementById('cve-matrix-body');
+    const totals = document.getElementById('cve-enterprise-totals');
+
+    if (!groups || !groups.length) {
+        body.innerHTML = '<tr><td colspan="11" style="color:var(--text-muted);padding:20px;text-align:center;">No CVE data — run a refresh or reseed</td></tr>';
+        totals.textContent = '';
+        return;
+    }
+
+    // Per-column max for column-wise heat shading
+    const maxCrit = Math.max(...groups.map(g => g.critical || 0), 1);
+    const maxHigh = Math.max(...groups.map(g => g.high || 0), 1);
+    const maxMed  = Math.max(...groups.map(g => g.medium || 0), 1);
+    const maxLow  = Math.max(...groups.map(g => g.low || 0), 1);
+    const maxTR   = Math.max(...groups.map(g => g.avg_trurisk || 0), 1);
+    const maxAff  = Math.max(...groups.map(g => g.top_cve_affected_hosts || 0), 1);
+
+    body.innerHTML = groups.map(g => {
+        const titleTip = g.top_cve_title ? g.top_cve_title.replace(/"/g, '&quot;') : '';
+        const topCveCell = g.top_cve
+            ? `<a href="/query?qid=${encodeURIComponent(g.top_cve)}" title="${titleTip}"><strong>${g.top_cve}</strong></a>
+               ${g.top_cve_cvss != null ? '<small style="color:var(--text-muted);margin-left:4px;">CVSS ' + g.top_cve_cvss.toFixed(1) + '</small>' : ''}
+               ${g.top_cve_title ? '<br><small style="color:var(--text-secondary);font-size:11px;">' + g.top_cve_title + '</small>' : ''}`
+            : '<span style="color:var(--text-muted);">—</span>';
+        const affectedCell = g.top_cve
+            ? `<span style="${cellShade(g.top_cve_affected_hosts || 0, maxAff, 0)}padding:2px 6px;border-radius:3px;">${(g.top_cve_affected_hosts || 0).toLocaleString()}</span>`
+            : '<span style="color:var(--text-muted);">—</span>';
+        return `<tr>
+            <td style="position:sticky;left:0;background:var(--bg-primary);z-index:1;"><strong>${g.name || 'Unknown'}</strong></td>
+            <td style="text-align:right;">${(g.unique_hosts || 0).toLocaleString()}</td>
+            <td style="text-align:right;">${(g.total_cves || 0).toLocaleString()}</td>
+            <td style="text-align:right;${cellShade(g.critical, maxCrit, 0)}">${(g.critical || 0).toLocaleString()}</td>
+            <td style="text-align:right;${cellShade(g.high, maxHigh, 20)}">${(g.high || 0).toLocaleString()}</td>
+            <td style="text-align:right;${cellShade(g.medium, maxMed, 45)}">${(g.medium || 0).toLocaleString()}</td>
+            <td style="text-align:right;${cellShade(g.low, maxLow, 140)}">${(g.low || 0).toLocaleString()}</td>
+            <td style="text-align:right;">${g.max_cvss != null ? g.max_cvss.toFixed(1) : ''}</td>
+            <td style="text-align:right;${cellShade(g.avg_trurisk || 0, maxTR, 280)}">${g.avg_trurisk != null ? Math.round(g.avg_trurisk).toLocaleString() : '<span style="color:var(--text-muted);">—</span>'}</td>
+            <td>${topCveCell}</td>
+            <td style="text-align:right;">${affectedCell}</td>
+        </tr>`;
+    }).join('');
+
+    totals.textContent =
+        `Enterprise: ${enterprise.unique_hosts || 0} hosts · ${enterprise.total_cves || 0} distinct CVEs · ` +
+        `${enterprise.critical || 0} crit / ${enterprise.high || 0} high / ${enterprise.medium || 0} med / ${enterprise.low || 0} low`;
+}
+
+function exportCveMatrix() {
+    const groups = currentCveData.groups || [];
+    if (!groups.length) return;
+    const header = ['Group', 'Hosts', 'Distinct CVEs', 'Critical', 'High', 'Medium', 'Low',
+                    'Max CVSS', 'Avg TruRisk',
+                    'Top Critical CVE', 'Top Critical CVE Title', 'Top Critical CVE CVSS', 'Top Critical CVE Affected Hosts'];
+    const rows = groups.map(g => [
+        g.name, g.unique_hosts, g.total_cves,
+        g.critical, g.high, g.medium, g.low,
+        g.max_cvss, g.avg_trurisk != null ? Math.round(g.avg_trurisk) : '',
+        g.top_cve || '', g.top_cve_title || '', g.top_cve_cvss != null ? g.top_cve_cvss.toFixed(1) : '',
+        g.top_cve_affected_hosts || 0,
+    ].map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(','));
+    const csv = [header.join(','), ...rows].join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+    a.download = 'six_pack_cve_matrix.csv';
+    a.click();
+}
+
+let waterfallChart = null;
+let osOwnershipChart = null;
+
+// Keep the owner <select> for the waterfall in sync with the 6-Pack groups.
+function populateWaterfallOwnerSelect(groups) {
+    const sel = document.getElementById('waterfall-owner');
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">All ownership (enterprise)</option>' +
+        (groups || []).map(g => `<option value="${encodeURIComponent(g.name).replace(/'/g,'&apos;')}">${g.name}</option>`).join('');
+    // Try to preserve the user's previous pick across group-by changes
+    if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+}
+
+async function loadWaterfall() {
+    const groupBy = document.getElementById('group-by').value;
+    const ownerEnc = document.getElementById('waterfall-owner').value;
+    const owner = ownerEnc ? decodeURIComponent(ownerEnc) : '';
+    const monthsWindow = document.getElementById('waterfall-months').value || '12';
+    const url = '/api/six-pack/waterfall?group_by=' + encodeURIComponent(groupBy)
+        + '&months=' + encodeURIComponent(monthsWindow)
+        + (owner ? '&owner=' + encodeURIComponent(owner) : '');
+    const data = await fetchApi(url);
+    if (!data) return;
+
+    const startActive = data.start_active || 0;
+    const endActive = data.end_active || 0;
+    const newArr = data.new || [];
+    const fixedArr = data.fixed || [];
+    const reopArr = data.reopened || [];
+    const monthsArr = data.months || [];
+
+    // Sum the per-month change-log buckets across the whole window so the
+    // waterfall decomposes exactly five quantities the user cares about:
+    //   Last Period Active  →  + New  +  Re-opened  -  Fixed  →  Current Active
+    const totalNew   = newArr.reduce((a, b) => a + b, 0);
+    const totalFixed = fixedArr.reduce((a, b) => a + b, 0);
+    const totalReop  = reopArr.reduce((a, b) => a + b, 0);
+
+    // Resolve the actual calendar dates for the two anchors so the user can
+    // see exactly which window the deltas were measured against.
+    //   start = first day of the earliest month in the window
+    //   end   = today (end_active is taken from the live snapshot)
+    const fmtDay = (d) => d.toLocaleDateString(undefined,
+        { day: 'numeric', month: 'short', year: 'numeric' });
+    let startDateStr = '', endDateStr = '', windowDays = 0;
+    if (monthsArr.length) {
+        const [y, m] = monthsArr[0].split('-').map(Number);
+        const startDate = new Date(Date.UTC(y, m - 1, 1));
+        const endDate = new Date();
+        startDateStr = fmtDay(startDate);
+        endDateStr = fmtDay(endDate);
+        windowDays = Math.round((endDate - startDate) / (1000 * 60 * 60 * 24));
+    }
+
+    // Distinct color per bar so each lifecycle event is visually separable.
+    const C_LAST    = '#475569';  // slate-600 — last period anchor
+    const C_NEW     = '#ef4444';  // red       — new detections
+    const C_REOP    = '#f59e0b';  // amber     — re-opened
+    const C_FIXED   = '#10b981';  // emerald   — fixed
+    const C_CURRENT = '#1e40af';  // deep blue — current anchor
+
+    const rangeEl = document.getElementById('waterfall-range');
+    if (rangeEl) rangeEl.innerHTML = monthsArr.length
+        ? '<strong>' + startDateStr + '</strong>  →  <strong>' + endDateStr + '</strong>'
+          + '  <span style="color:var(--text-muted);font-weight:400;">('
+          + windowDays + ' days · ' + monthsArr.length
+          + ' month' + (monthsArr.length === 1 ? '' : 's') + ')</span>'
+        : 'No data for this window';
+
+    // Surface the back-derived-anchor warning identically across view modes,
+    // since both views show the start/end Active anchors implicitly.
+    const warn = document.getElementById('waterfall-warning');
+    if (warn) {
+        if (data.reconciled === false) {
+            warn.textContent = '⚠ Some change events fall outside the ' + monthsWindow
+                + '-month change log; starting Active is back-derived from current Active and the captured deltas.';
+            warn.style.display = '';
+        } else {
+            warn.style.display = 'none';
+        }
+    }
+
+    const view = (document.getElementById('waterfall-view') || {}).value || 'lifecycle';
+    if (waterfallChart) waterfallChart.destroy();
+    waterfallChart = (view === 'monthly')
+        ? buildMonthlyWaterfall(monthsArr, newArr, reopArr, fixedArr,
+                                {C_NEW, C_REOP, C_FIXED}, startActive, endActive,
+                                startDateStr, endDateStr)
+        : buildLifecycleWaterfall(startActive, endActive, totalNew, totalReop, totalFixed,
+                                  {C_LAST, C_NEW, C_REOP, C_FIXED, C_CURRENT},
+                                  startDateStr, endDateStr, data.reconciled !== false);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Lifecycle (5-bar) waterfall — single window decomposition.
+// Original/default view; preserved verbatim so a user can revert any time
+// by switching the View selector back to "Lifecycle".
+// ────────────────────────────────────────────────────────────────────────────
+function buildLifecycleWaterfall(startActive, endActive, totalNew, totalReop, totalFixed,
+                                 colors, startDateStr, endDateStr, reconciled) {
+    const {C_LAST, C_NEW, C_REOP, C_FIXED, C_CURRENT} = colors;
+
+    const labels = [
+        ['Last Period (Active)', startDateStr],
+        ['New',        '+' + totalNew.toLocaleString()],
+        ['Re-opened',  '+' + totalReop.toLocaleString()],
+        ['Fixed',      '-' + totalFixed.toLocaleString()],
+        ['Current (Active)', endDateStr],
+    ];
+    const afterNew  = startActive + totalNew;
+    const afterReop = afterNew + totalReop;
+    const afterFix  = afterReop - totalFixed;
+    const baseArr   = [0,           startActive, afterNew, afterFix, 0];
+    const deltaArr  = [startActive, totalNew,    totalReop, totalFixed, endActive];
+    const deltaColors = [C_LAST, C_NEW, C_REOP, C_FIXED, C_CURRENT];
+
+    return new Chart(document.getElementById('chart-waterfall'), {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [
+                { label: '_base', data: baseArr,
+                  backgroundColor: 'rgba(0,0,0,0)', borderColor: 'rgba(0,0,0,0)', stack: 'wf' },
+                { label: 'Active vulns', data: deltaArr,
+                  backgroundColor: deltaColors, borderColor: deltaColors,
+                  borderWidth: 1, borderRadius: 3, stack: 'wf' },
+            ],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    filter: (item) => item.dataset.label !== '_base',
+                    callbacks: {
+                        title: (items) => {
+                            const lab = labels[items[0].dataIndex];
+                            return Array.isArray(lab) ? lab[0] : lab;
+                        },
+                        label: (ctx) => {
+                            const i = ctx.dataIndex;
+                            const net = totalNew + totalReop - totalFixed;
+                            if (i === 0) return [
+                                `Date: ${startDateStr}`,
+                                `Active at start of window: ${startActive.toLocaleString()}`,
+                                reconciled ? '' : '(back-derived from current Active)',
+                            ].filter(Boolean);
+                            if (i === 1) return [
+                                `New detections: +${totalNew.toLocaleString()}`,
+                                `(first_found between ${startDateStr} and ${endDateStr})`,
+                            ];
+                            if (i === 2) return [
+                                `Re-opened: +${totalReop.toLocaleString()}`,
+                                `(returned from Fixed → Active in window)`,
+                            ];
+                            if (i === 3) return [
+                                `Fixed: -${totalFixed.toLocaleString()}`,
+                                `(moved Active → Fixed in window)`,
+                            ];
+                            return [
+                                `Date: ${endDateStr}`,
+                                `Active now: ${endActive.toLocaleString()}`,
+                                `Net change: ${net >= 0 ? '+' : ''}${net.toLocaleString()}`,
+                            ];
+                        },
+                    },
+                },
+            },
+            scales: {
+                x: { stacked: true, grid: { display: false },
+                     ticks: { autoSkip: false, maxRotation: 0, minRotation: 0, font: {size: 10} } },
+                y: { stacked: true, beginAtZero: true,
+                     title: { display: true, text: 'Active vulnerabilities' },
+                     ticks: { precision: 0 } },
+            },
+            categoryPercentage: 0.85,
+            barPercentage: 0.92,
+        },
+    });
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Monthly deltas — one stacked bar per month.
+// Each month shows three signed segments stacked from zero:
+//   +New (red, up), +Re-opened (amber, up), -Fixed (green, drawn below zero)
+// Bar height above zero = inflows that month; height below zero = outflows.
+// Net change for the month = (top of stack) + (bottom of stack).
+// ────────────────────────────────────────────────────────────────────────────
+function buildMonthlyWaterfall(monthsArr, newArr, reopArr, fixedArr, colors,
+                               startActive, endActive, startDateStr, endDateStr) {
+    const {C_NEW, C_REOP, C_FIXED} = colors;
+    const labels = monthsArr.map(fmtMonth);
+    // Fixed plotted as negative so it stacks below zero — keeps inflows/outflows
+    // visually separated and the bar height becomes the absolute delta.
+    const fixedNeg = fixedArr.map(v => -(v || 0));
+
+    // Running Active total per month — starts at startActive, then adds each
+    // month's net (new + reopened - fixed). Plotted on a secondary y-axis so
+    // its much larger magnitude (~1500) doesn't squash the delta bars (~±60).
+    const runningActive = [];
+    let cur = startActive;
+    for (let i = 0; i < monthsArr.length; i++) {
+        cur += (newArr[i] || 0) + (reopArr[i] || 0) - (fixedArr[i] || 0);
+        runningActive.push(cur);
+    }
+    const C_ACTIVE = '#1e40af';  // deep blue — matches the lifecycle "Current" anchor
+
+    return new Chart(document.getElementById('chart-waterfall'), {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [
+                { label: 'New',       data: newArr,   backgroundColor: C_NEW,   stack: 'm', borderRadius: 2, yAxisID: 'y' },
+                { label: 'Re-opened', data: reopArr,  backgroundColor: C_REOP,  stack: 'm', borderRadius: 2, yAxisID: 'y' },
+                { label: 'Fixed',     data: fixedNeg, backgroundColor: C_FIXED, stack: 'm', borderRadius: 2, yAxisID: 'y' },
+                {
+                    type: 'line',
+                    label: 'Total Active (end of month)',
+                    data: runningActive,
+                    borderColor: C_ACTIVE,
+                    backgroundColor: C_ACTIVE,
+                    borderWidth: 2.5,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    tension: 0.25,
+                    yAxisID: 'yActive',
+                    order: 0,  // draw on top of bars
+                },
+            ],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: {
+                legend: { position: 'bottom', labels: { font: { size: 11 } } },
+                tooltip: {
+                    mode: 'index', intersect: false,
+                    callbacks: {
+                        title: (items) => items[0].label + (items[0].dataIndex === 0
+                            ? ` · starts at Active=${startActive.toLocaleString()}`
+                            : items[0].dataIndex === labels.length - 1
+                                ? ` · ends at Active=${endActive.toLocaleString()}`
+                                : ''),
+                        label: (ctx) => {
+                            const v = ctx.parsed.y;
+                            if (ctx.dataset.label === 'Total Active (end of month)')
+                                return `Active end-of-month: ${v.toLocaleString()}`;
+                            const sign = ctx.dataset.label === 'Fixed' ? '-' : '+';
+                            return `${ctx.dataset.label}: ${sign}${Math.abs(v).toLocaleString()}`;
+                        },
+                        footer: (items) => {
+                            const i = items[0].dataIndex;
+                            const net = (newArr[i] || 0) + (reopArr[i] || 0) - (fixedArr[i] || 0);
+                            return 'Net this month: ' + (net >= 0 ? '+' : '') + net.toLocaleString();
+                        },
+                    },
+                },
+            },
+            scales: {
+                x: { stacked: true, grid: { display: false },
+                     ticks: { autoSkip: false, maxRotation: 0, minRotation: 0, font: {size: 10} } },
+                y: { stacked: true,
+                     position: 'left',
+                     title: { display: true, text: 'Per-month Δ (+ inflows / − outflows)' },
+                     ticks: { precision: 0,
+                              callback: (v) => (v >= 0 ? '+' : '') + v },
+                     grid: { color: (ctx) => ctx.tick.value === 0
+                              ? 'rgba(148,163,184,0.6)' : 'rgba(148,163,184,0.1)' } },
+                yActive: {
+                    position: 'right',
+                    title: { display: true, text: 'Total Active (line)', color: C_ACTIVE },
+                    ticks: { precision: 0, color: C_ACTIVE,
+                             callback: (v) => v.toLocaleString() },
+                    grid: { display: false },
+                },
+            },
+            categoryPercentage: 0.85,
+            barPercentage: 0.9,
+        },
+    });
+}
+
+async function loadOsOwnership() {
+    const groupBy = document.getElementById('group-by').value;
+    const data = await fetchApi('/api/six-pack/os?group_by=' + encodeURIComponent(groupBy));
+    if (!data) return;
+    if (osOwnershipChart) osOwnershipChart.destroy();
+    const OS_COLORS = { Windows: '#0078d4', Linux: '#f97316', macOS: '#8b5cf6', Other: '#64748b' };
+    const oses = data.oses || [];
+    const datasets = oses.map((osName, i) => ({
+        label: osName,
+        data: (data.matrix || []).map(row => row[i] || 0),
+        backgroundColor: OS_COLORS[osName] || TREND_COLORS[i % TREND_COLORS.length],
+    }));
+    osOwnershipChart = new Chart(document.getElementById('chart-os-ownership'), {
+        type: 'bar',
+        data: { labels: data.groups || [], datasets },
+        options: {
+            indexAxis: 'y',
+            responsive: true, maintainAspectRatio: false,
+            plugins: {
+                legend: { position: 'bottom' },
+                tooltip: { mode: 'index', intersect: false },
+            },
+            scales: {
+                x: { stacked: true, beginAtZero: true, title: { display: true, text: 'Open detections' } },
+                y: { stacked: true },
+            },
+        },
+    });
+}
+
+// Wire waterfall owner-select to refresh only the waterfall, not the whole page.
+document.getElementById('waterfall-owner').addEventListener('change', loadWaterfall);
+document.getElementById('waterfall-months').addEventListener('change', loadWaterfall);
+document.getElementById('waterfall-view').addEventListener('change', loadWaterfall);
+
+function refreshAll() {
+    loadSixPack().then(() => {
+        // Populate the waterfall owner list from whichever group we just loaded
+        // (groups are most meaningful when they match the current group_by).
+        if (currentCveData.groups && currentCveData.groups.length) {
+            populateWaterfallOwnerSelect(currentCveData.groups);
+        }
+    });
+    loadSixPackTrend();
+    loadCveMatrix().then(() => {
+        populateWaterfallOwnerSelect(currentCveData.groups || []);
+        loadWaterfall();
+    });
+    loadOsOwnership();
+}
+
+function exportSixPack() { window.location = '/api/export/csv?type=kpis'; }
+
+// Re-render both charts when grouping changes
+document.getElementById('group-by').removeAttribute('onchange');
+document.getElementById('group-by').addEventListener('change', refreshAll);
+
+refreshAll();
+</script>
+{% endblock %}

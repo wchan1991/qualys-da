@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block title %}CVE Dashboard - Qualys DA{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>CVE Dashboard</h1>
+    <div style="display:flex;gap:8px;align-items:center;">
+        <label style="font-size:12px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;">Months</label>
+        <select id="cve-months" class="btn" style="padding:6px 10px;">
+            <option value="6">6</option>
+            <option value="12" selected>12</option>
+            <option value="24">24</option>
+        </select>
+    </div>
+</div>
+
+<!-- Summary cards -->
+<div class="metrics-grid">
+    <a class="metric-card" href="/hosts" title="Hosts with at least one VM detection. Coverage = VM-scanned / (CSAM ∪ VM)">
+        <div class="metric-value" id="cv-resources">--</div>
+        <div class="metric-label">Resources Scanned</div>
+        <div class="metric-trend neutral" id="cv-coverage">--</div>
+    </a>
+    <a class="metric-card" href="/query?severity_min=5" title="CVSS >= 9.0"><div class="metric-value severity-5" id="cv-critical">--</div><div class="metric-label">Critical (9.0+)</div></a>
+    <a class="metric-card" href="/query?severity_min=4" title="CVSS 7.0-8.9"><div class="metric-value severity-4" id="cv-high">--</div><div class="metric-label">High (7.0-8.9)</div></a>
+    <a class="metric-card" href="/query?severity_min=3" title="CVSS 4.0-6.9"><div class="metric-value severity-3" id="cv-medium">--</div><div class="metric-label">Medium (4.0-6.9)</div></a>
+</div>
+
+<!-- Trend by severity (stacked bar) -->
+<div class="card">
+    <div class="card-header">
+        Trend by severity
+        <span style="float:right;font-weight:400;font-size:12px;color:var(--text-muted);">
+            Stacked by CVSS band &middot; by month of first_found
+        </span>
+    </div>
+    <div class="chart-container" style="height:320px;"><canvas id="chart-trend"></canvas></div>
+</div>
+
+<!-- Two-column: Top resources | Top patchable CVEs -->
+<div class="chart-row">
+    <div class="card">
+        <div class="card-header">Top 10 vulnerable resources</div>
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead><tr><th>Resource</th><th>OS</th><th style="text-align:right;">Max CVSS</th><th style="text-align:right;"># Vulnerabilities</th></tr></thead>
+                <tbody id="top-resources"><tr><td colspan="4" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header">Top 10 patchable vulnerabilities</div>
+        <div class="table-wrapper">
+            <table class="data-table">
+                <thead><tr><th>CVE</th><th>Title</th><th>Fix Version</th><th style="text-align:right;">CVSS</th><th style="text-align:right;"># Vulnerabilities</th></tr></thead>
+                <tbody id="top-patchable"><tr><td colspan="5" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Top 10 vulnerabilities -->
+<div class="card">
+    <div class="card-header">Top 10 vulnerabilities</div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>CVE</th>
+                    <th>Title</th>
+                    <th style="text-align:right;">CVSS</th>
+                    <th>Severity</th>
+                    <th>Package Name</th>
+                    <th>Package Version</th>
+                    <th>Fix Version</th>
+                    <th style="text-align:right;"># Vulnerabilities</th>
+                </tr>
+            </thead>
+            <tbody id="top-cves"><tr><td colspan="8" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr></tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let trendChart = null;
+
+const MONTH_ABBR = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+function fmtMonth(ym) {
+    if (!ym || typeof ym !== 'string') return ym;
+    const p = ym.split('-');
+    if (p.length < 2) return ym;
+    const i = parseInt(p[1], 10) - 1;
+    if (i < 0 || i > 11) return ym;
+    return MONTH_ABBR[i] + ' ' + p[0];
+}
+
+function cvssBand(v) {
+    if (v == null) return '';
+    if (v >= 9.0) return 'Critical';
+    if (v >= 7.0) return 'High';
+    if (v >= 4.0) return 'Medium';
+    if (v > 0)   return 'Low';
+    return 'None';
+}
+function bandClass(band) {
+    return ({Critical:'badge-critical', High:'badge-high', Medium:'badge-medium', Low:'badge-low'})[band] || 'badge-low';
+}
+
+async function loadCveDashboard() {
+    const months = document.getElementById('cve-months').value;
+    const data = await fetchApi('/api/cve-dashboard?months=' + months);
+    if (!data) return;
+
+    const s = data.summary || {};
+    setText('cv-resources', (s.resources_scanned || 0).toLocaleString());
+    setText('cv-coverage',  (s.resources_scanned || 0).toLocaleString() + ' / ' + (s.total_hosts || 0).toLocaleString() + ' (' + (s.coverage_pct || 0) + '% coverage)');
+    setText('cv-critical',  (s.critical || 0).toLocaleString());
+    setText('cv-high',      (s.high || 0).toLocaleString());
+    setText('cv-medium',    (s.medium || 0).toLocaleString());
+
+    // Trend chart — stacked bar
+    const t = data.trend || {};
+    const labels = (t.months || []).map(fmtMonth);
+    const ctx = document.getElementById('chart-trend');
+    if (trendChart) trendChart.destroy();
+    trendChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels,
+            datasets: [
+                { label: 'Critical', data: t.critical || [], backgroundColor: '#ef4444' },
+                { label: 'High',     data: t.high || [],     backgroundColor: '#ea580c' },
+                { label: 'Medium',   data: t.medium || [],   backgroundColor: '#f59e0b' },
+                { label: 'Low',      data: t.low || [],      backgroundColor: '#10b981' },
+            ],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { position: 'bottom' } },
+            scales: {
+                x: { stacked: true },
+                y: { stacked: true, beginAtZero: true },
+            },
+        },
+    });
+
+    // Top resources
+    const tr = document.getElementById('top-resources');
+    if ((data.top_resources || []).length) {
+        tr.innerHTML = data.top_resources.map(r => `<tr>
+            <td><a href="/hosts?ip=${r.ip_address}">${r.dns || r.ip_address || ''}</a><br><small style="color:var(--text-muted)">${r.ip_address || ''}</small></td>
+            <td style="color:var(--text-muted);font-size:12px;">${r.os || ''}</td>
+            <td style="text-align:right;">${r.max_cvss != null ? r.max_cvss.toFixed(1) : ''}</td>
+            <td style="text-align:right;"><strong>${(r.vulns || 0).toLocaleString()}</strong></td>
+        </tr>`).join('');
+    } else {
+        tr.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);padding:20px;text-align:center;">No data</td></tr>';
+    }
+
+    // Top patchable
+    const tp = document.getElementById('top-patchable');
+    if ((data.top_patchable || []).length) {
+        tp.innerHTML = data.top_patchable.map(r => `<tr>
+            <td><strong>${r.cve_id || ''}</strong></td>
+            <td style="font-size:12px;">${r.title || ''}</td>
+            <td><code style="font-size:12px;">${r.fix_version || ''}</code></td>
+            <td style="text-align:right;">${r.cvss != null ? r.cvss.toFixed(1) : ''}</td>
+            <td style="text-align:right;"><strong>${(r.vulnerabilities || 0).toLocaleString()}</strong></td>
+        </tr>`).join('');
+    } else {
+        tp.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);padding:20px;text-align:center;">No data</td></tr>';
+    }
+
+    // Top CVEs
+    const tc = document.getElementById('top-cves');
+    if ((data.top_cves || []).length) {
+        tc.innerHTML = data.top_cves.map(r => {
+            const band = cvssBand(r.cvss);
+            return `<tr>
+                <td><strong>${r.cve_id || ''}</strong></td>
+                <td style="font-size:12px;">${r.title || ''}</td>
+                <td style="text-align:right;">${r.cvss != null ? r.cvss.toFixed(1) : ''}</td>
+                <td><span class="badge ${bandClass(band)}">${band}</span></td>
+                <td><code style="font-size:12px;">${r.package_name || ''}</code></td>
+                <td style="font-size:12px;">${r.package_version || ''}</td>
+                <td><code style="font-size:12px;">${r.fix_version || ''}</code></td>
+                <td style="text-align:right;"><strong>${(r.vulnerabilities || 0).toLocaleString()}</strong></td>
+            </tr>`;
+        }).join('');
+    } else {
+        tc.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);padding:20px;text-align:center;">No CVE data — re-seed the database to populate test CVEs</td></tr>';
+    }
+}
+
+document.getElementById('cve-months').addEventListener('change', loadCveDashboard);
+loadCveDashboard();
+</script>
+{% endblock %}
