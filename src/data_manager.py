@@ -52,6 +52,83 @@ class DataManager:
     def __exit__(self, *args):
         self.close()
 
+    # ── CSAM fetch with resume checkpoint ────────────────────────
+    #
+    # Wraps `client.fetch_csam_assets()` with the database-backed resume
+    # checkpoint. If a prior pull was rate-limited or crashed, we read the
+    # saved `last_asset_id` and pass it as `startFromId` so the next pull
+    # picks up where we left off. A per-page callback persists progress so
+    # even a kill-9 leaves us resumable on the next run.
+    def _fetch_csam_with_checkpoint(self, *, expected: Optional[int] = None
+                                    ) -> List[Dict]:
+        checkpoint = None
+        resume_from = None
+        if self.config.csam_resume_enabled:
+            checkpoint = self.db.get_csam_checkpoint()
+            if checkpoint and not checkpoint["completed"]:
+                resume_from = checkpoint["last_asset_id"]
+                if resume_from:
+                    logger.info(
+                        f"CSAM resume: previous pull stopped at asset "
+                        f"{resume_from} after {checkpoint['assets_pulled']:,} "
+                        f"assets — continuing from there."
+                    )
+
+        # Mark the checkpoint "running" up front so an immediate crash still
+        # leaves state for the next run. started_at is explicit only when we
+        # are actually starting fresh (resume_from is None).
+        started_now = datetime.utcnow().isoformat()
+        if resume_from is None:
+            self.db.update_csam_checkpoint(
+                last_asset_id=None,
+                assets_pulled=0,
+                completed=False,
+                lookback_days=self.config.csam_lookback_days,
+                started_at=started_now,
+                note="running",
+            )
+
+        def _on_page(page, total, last_id, has_more):
+            # Persist after every page so we can resume if we die mid-pull.
+            self.db.update_csam_checkpoint(
+                last_asset_id=last_id,
+                assets_pulled=total,
+                completed=(not has_more),
+                lookback_days=self.config.csam_lookback_days,
+                note=f"page {page}",
+            )
+
+        try:
+            assets = self.client.fetch_csam_assets(
+                expected=expected,
+                lookback_days=self.config.csam_lookback_days,
+                resume_from_id=resume_from,
+                on_page=_on_page,
+            )
+            # Clean completion — always mark as done so the next refresh
+            # starts fresh (won't accidentally resume on the next run).
+            self.db.update_csam_checkpoint(
+                last_asset_id=None,
+                assets_pulled=len(assets),
+                completed=True,
+                lookback_days=self.config.csam_lookback_days,
+                note="complete",
+            )
+            return assets
+        except Exception as e:
+            # on_page has already persisted the latest last_asset_id; we
+            # just annotate why the pull stopped so `status` output is
+            # informative.
+            latest = self.db.get_csam_checkpoint() or {}
+            self.db.update_csam_checkpoint(
+                last_asset_id=latest.get("last_asset_id"),
+                assets_pulled=latest.get("assets_pulled", 0),
+                completed=False,
+                lookback_days=self.config.csam_lookback_days,
+                note=f"interrupted: {type(e).__name__}: {e}"[:200],
+            )
+            raise
+
     # ── Refresh ──────────────────────────────────────────────────
 
     def refresh_all(self) -> Dict[str, Any]:
@@ -109,7 +186,7 @@ class DataManager:
                 logger.info("Fetching CSAM and VM in parallel...")
 
                 def _csam_thread():
-                    return self.client.fetch_csam_assets(expected=csam_expected)
+                    return self._fetch_csam_with_checkpoint(expected=csam_expected)
 
                 def _vm_thread():
                     # Hosts + detections share the VM session's auth cookie and
@@ -129,7 +206,7 @@ class DataManager:
                     vm_hosts, vm_detections = vm_future.result()
             else:
                 logger.info("Fetching sequentially (parallel_refresh=false)...")
-                csam_assets = self.client.fetch_csam_assets(expected=csam_expected)
+                csam_assets = self._fetch_csam_with_checkpoint(expected=csam_expected)
                 vm_hosts = self.client.fetch_vm_hosts(expected=vm_host_expected)
                 vm_detections = self.client.fetch_vm_detections(expected=vm_det_expected)
 
@@ -166,6 +243,8 @@ class DataManager:
                 vm_detection_expected=vm_det_expected,
                 **counts,
             )
+            # Drop the dashboard cache so the next page load sees new data.
+            self.analytics.invalidate_cache()
             logger.info(f"Refresh complete: {counts}")
 
         except AuthError:
@@ -182,11 +261,12 @@ class DataManager:
         refresh_id = self.db.log_refresh("csam")
         now = datetime.utcnow().isoformat()
         try:
-            assets = self.client.fetch_csam_assets()
+            assets = self._fetch_csam_with_checkpoint()
             count = self.db.save_csam_assets(assets, now)
             tags = QualysClient.extract_tags_from_csam(assets)
             self.db.save_host_tags(tags, now)
             self.db.complete_refresh(refresh_id, csam=count)
+            self.analytics.invalidate_cache()
             return count
         except Exception as e:
             self.db.complete_refresh(refresh_id, status="failed", error=str(e))
@@ -201,6 +281,7 @@ class DataManager:
             tags = QualysClient.extract_tags_from_vm_hosts(hosts)
             self.db.save_host_tags(tags, now)
             self.db.complete_refresh(refresh_id, vm_hosts=count)
+            self.analytics.invalidate_cache()
             return count
         except Exception as e:
             self.db.complete_refresh(refresh_id, status="failed", error=str(e))
@@ -219,6 +300,7 @@ class DataManager:
             self.db.save_detection_changes(changes)
             self.analytics.compute_weekly_rollup()
             self.db.complete_refresh(refresh_id, vm_detections=count, changes=len(changes))
+            self.analytics.invalidate_cache()
             return count
         except Exception as e:
             self.db.complete_refresh(refresh_id, status="failed", error=str(e))

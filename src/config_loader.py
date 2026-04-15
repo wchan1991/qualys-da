@@ -39,6 +39,10 @@ class QualysDAConfig:
     parallel_refresh: bool = True   # Pull VM and CSAM in parallel (~40-50% faster)
     csam_page_size: int = 1000      # Assets per CSAM call (max 1000). 104k assets
                                     # → 104 calls at 1000, vs 347 calls at 300.
+    csam_lookback_days: int = 90    # Server-side QQL filter on 'lastCheckedIn'.
+                                    # 0 = no filter (pull everything).
+    csam_resume_enabled: bool = True  # Resume from last asset ID if a prior pull
+                                      # was interrupted (rate-limit / crash).
 
     # Database
     db_path: str = "data/qualys_da.db"
@@ -196,6 +200,8 @@ def load_config(config_path: Optional[Path] = None) -> QualysDAConfig:
         calls_per_minute=get_int("rate_limit", "calls_per_minute", 60),
         parallel_refresh=get_bool("api", "parallel_refresh", True),
         csam_page_size=get_int("api", "csam_page_size", 1000),
+        csam_lookback_days=get_int("api", "csam_lookback_days", 90),
+        csam_resume_enabled=get_bool("api", "csam_resume_enabled", True),
         db_path=get_str("database", "db_path", "data/qualys_da.db"),
         daily_retention_days=get_int("retention", "daily_retention_days", 30),
         weekly_retention_weeks=get_int("retention", "weekly_retention_weeks", 52),

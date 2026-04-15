@@ -36,6 +36,14 @@ parallel_refresh = true
 # CSAM page size (max 1000). Larger = fewer API calls but bigger responses.
 # At 104k assets: 1000→104 calls, 300→347 calls.
 csam_page_size = 1000
+# Only pull CSAM assets seen in the last N days (server-side QQL filter on
+# 'lastCheckedIn'). Dramatically cuts API volume for big tenants. Set to 0
+# to disable the filter and pull everything.
+csam_lookback_days = 90
+# If a pull is interrupted (rate-limit / crash / killed mid-run), remember the
+# last asset ID and resume from there next time. Set to false to always start
+# from the beginning.
+csam_resume_enabled = true
 
 [rate_limit]
 calls_per_minute = 60

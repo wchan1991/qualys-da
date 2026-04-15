@@ -324,6 +324,24 @@ class QualysDADatabase:
             except sqlite3.OperationalError:
                 pass  # column already exists
 
+        # ── CSAM Pull Checkpoint (single-row resume state) ────────
+        # One row max (enforced by CHECK id = 1). On each page of a CSAM pull
+        # we upsert last_asset_id; when the pull finishes cleanly we flip
+        # completed=1. A fresh pull that finds completed=0 resumes from
+        # last_asset_id (passed as startFromId to the Qualys API).
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS csam_checkpoint (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_asset_id TEXT,
+                assets_pulled INTEGER DEFAULT 0,
+                started_at TEXT,
+                updated_at TEXT,
+                completed INTEGER DEFAULT 0,
+                lookback_days INTEGER,
+                note TEXT
+            )
+        """)
+
         # ── Indexes ──────────────────────────────────────────────
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_csam_ip ON csam_assets(ip_address)",
@@ -637,6 +655,69 @@ class QualysDADatabase:
              csam_expected, vm_host_expected, vm_detection_expected,
              refresh_id),
         )
+        self.conn.commit()
+
+    # ── CSAM Resume Checkpoint ──────────────────────────────────
+    # Tiny single-row table that remembers the last asset ID of the most
+    # recent CSAM pull. Lets us resume after a rate-limit / crash instead
+    # of re-fetching the first N pages on the next run.
+
+    def get_csam_checkpoint(self) -> Optional[Dict]:
+        """Return the current CSAM checkpoint row, or None if no pull has run."""
+        row = self.conn.execute(
+            "SELECT last_asset_id, assets_pulled, started_at, updated_at, "
+            "completed, lookback_days, note FROM csam_checkpoint WHERE id = 1"
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "last_asset_id": row[0],
+            "assets_pulled": row[1] or 0,
+            "started_at": row[2],
+            "updated_at": row[3],
+            "completed": bool(row[4]),
+            "lookback_days": row[5],
+            "note": row[6],
+        }
+
+    def update_csam_checkpoint(self, last_asset_id: Optional[str],
+                               assets_pulled: int,
+                               completed: bool,
+                               lookback_days: Optional[int] = None,
+                               started_at: Optional[str] = None,
+                               note: Optional[str] = None) -> None:
+        """Upsert the single checkpoint row. `started_at` is preserved across
+        updates when None — we only set it on the very first page of a run."""
+        now = datetime.utcnow().isoformat()
+        existing = self.get_csam_checkpoint()
+        if existing is None:
+            self.conn.execute(
+                """INSERT INTO csam_checkpoint
+                   (id, last_asset_id, assets_pulled, started_at, updated_at,
+                    completed, lookback_days, note)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?)""",
+                (last_asset_id, assets_pulled, started_at or now, now,
+                 1 if completed else 0, lookback_days, note),
+            )
+        else:
+            # Keep the original started_at unless the caller is explicitly
+            # starting a new pull (completed=True on the prior row means the
+            # next update is a fresh start; we detect that on the caller side
+            # by passing started_at explicitly).
+            preserved_start = started_at or existing["started_at"] or now
+            self.conn.execute(
+                """UPDATE csam_checkpoint
+                   SET last_asset_id=?, assets_pulled=?, started_at=?,
+                       updated_at=?, completed=?, lookback_days=?, note=?
+                   WHERE id=1""",
+                (last_asset_id, assets_pulled, preserved_start, now,
+                 1 if completed else 0, lookback_days, note),
+            )
+        self.conn.commit()
+
+    def clear_csam_checkpoint(self) -> None:
+        """Wipe the checkpoint — forces next pull to start from the beginning."""
+        self.conn.execute("DELETE FROM csam_checkpoint WHERE id = 1")
         self.conn.commit()
 
     # ── Query Methods ────────────────────────────────────────────

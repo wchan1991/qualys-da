@@ -13,7 +13,7 @@ import logging
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass, field
 
 import requests
@@ -772,36 +772,67 @@ class QualysClient:
 
     def fetch_csam_assets(self, max_pages: int = 500,
                           expected: Optional[int] = None,
-                          page_size: Optional[int] = None) -> List[Dict]:
-        """Fetch all assets from CSAM Asset Host Data API.
+                          page_size: Optional[int] = None,
+                          lookback_days: Optional[int] = None,
+                          resume_from_id: Optional[str] = None,
+                          on_page: Optional[Callable[[int, int, Optional[str], bool], None]] = None
+                          ) -> List[Dict]:
+        """Fetch assets from CSAM Asset Host Data API.
 
-        If `expected` is given (from count_csam_assets()), logs it upfront
-        and warns if the fetched total drifts.
+        Parameters
+        ----------
+        max_pages : safety cap on pagination loops.
+        expected  : total from count_csam_assets() for progress / drift logging.
+        page_size : assets per request (1-1000). Defaults to config.csam_page_size.
+        lookback_days : if > 0, server-side filter restricts to assets whose
+            `lastCheckedIn` is within the last N days. 0 / None = no filter.
+            If Qualys rejects the filter on the first page, we log a warning
+            and retry once without it (so an unknown QQL field can't break
+            the whole refresh).
+        resume_from_id : Qualys asset ID to pass as `startFromId` on the very
+            first page. Used to resume after a rate-limited / crashed run.
+        on_page : optional callback fired AFTER each successful page as
+            `on_page(page_num, assets_fetched_so_far, last_seen_id, has_more)`.
+            The caller uses this to persist a resume checkpoint after every
+            page, so even a kill-9 mid-pull leaves us resumable.
 
-        `page_size` defaults to `config.csam_page_size` (1000). Bumping
-        from the old 300 cuts a 104k-asset pull from ~347 calls to ~104.
-        The CSAM API supports up to 1000 per request; lower if a tenant
-        throttles aggressively.
+        Returns the full list of asset dicts. If `RateLimitError` or any
+        other exception bubbles up, `on_page` will already have been called
+        for every page we successfully consumed, so the checkpoint is current.
         """
         if page_size is None:
             page_size = getattr(self.config, "csam_page_size", 1000)
         # Qualys CSAM search accepts up to 1000; cap defensively.
         page_size = max(1, min(int(page_size), 1000))
 
+        # Resolve lookback: explicit arg wins, otherwise config default.
+        if lookback_days is None:
+            lookback_days = getattr(self.config, "csam_lookback_days", 0)
+        # Set filter_enabled up front; may be cleared by the 400-fallback below.
+        filter_enabled = bool(lookback_days and lookback_days > 0)
+        filter_qql: Optional[str] = None
+        if filter_enabled:
+            cutoff = datetime.utcnow() - timedelta(days=int(lookback_days))
+            cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+            # QQL range syntax supported by CSAM v2 search.
+            filter_qql = f"lastCheckedIn >= '{cutoff_iso}'"
+
+        banner_bits = [f"page_size: {page_size}"]
         if expected is not None:
-            logger.info(
-                f"Fetching CSAM assets... (expected: {expected:,}, "
-                f"page_size: {page_size})"
-            )
-        else:
-            logger.info(f"Fetching CSAM assets... (page_size: {page_size})")
-        all_assets = []
-        last_seen_id = None
+            banner_bits.insert(0, f"expected: {expected:,}")
+        if filter_enabled:
+            banner_bits.append(f"lookback: {lookback_days}d")
+        if resume_from_id:
+            banner_bits.append(f"resume_from_id: {resume_from_id}")
+        logger.info(f"Fetching CSAM assets... ({', '.join(banner_bits)})")
+
+        all_assets: List[Dict] = []
+        last_seen_id: Optional[str] = resume_from_id
         page = 0
 
         while page < max_pages:
             page += 1
-            body = {
+            body: Dict[str, Any] = {
                 "ServiceRequest": {
                     "preferences": {
                         "limitResults": page_size,
@@ -810,6 +841,10 @@ class QualysClient:
             }
             if last_seen_id:
                 body["ServiceRequest"]["preferences"]["startFromId"] = last_seen_id
+            if filter_enabled and filter_qql:
+                # CSAM v2 search accepts a QQL `filter` string at the
+                # ServiceRequest level.
+                body["ServiceRequest"]["filter"] = filter_qql
 
             response = self._csam_request(
                 "POST",
@@ -817,6 +852,20 @@ class QualysClient:
                 json_body=body,
                 timeout=120,
             )
+
+            # Defensive filter fallback: if Qualys rejects the filter with a
+            # 4xx on the FIRST page only, drop it and retry. This guards
+            # against QQL field-name drift without breaking refreshes.
+            if (response.status_code == 400 and filter_enabled
+                    and page == 1 and not resume_from_id):
+                logger.warning(
+                    "CSAM rejected lookback filter (HTTP 400). Retrying "
+                    "without the 'lastCheckedIn' filter. Check Qualys docs "
+                    "if this tenant uses a different field name."
+                )
+                filter_enabled = False
+                page -= 1  # redo page 1 without filter
+                continue
 
             if response.status_code != 200:
                 raise QualysError(
@@ -829,6 +878,17 @@ class QualysClient:
 
             if response_code not in ("SUCCESS", ""):
                 error_msg = resp_data.get("responseErrorDetails", {}).get("errorMessage", response_code)
+                # Same fallback path as the 400 branch above — if the filter
+                # was the problem, try once without it.
+                if (filter_enabled and page == 1 and not resume_from_id
+                        and "filter" in str(error_msg).lower()):
+                    logger.warning(
+                        f"CSAM filter rejected: {error_msg}. Retrying "
+                        f"without the lookback filter."
+                    )
+                    filter_enabled = False
+                    page -= 1
+                    continue
                 raise QualysError(f"CSAM API error: {error_msg}")
 
             asset_list = resp_data.get("data", resp_data.get("assetListData", {}))
@@ -844,6 +904,19 @@ class QualysClient:
 
             all_assets.extend(assets)
 
+            has_more = resp_data.get("hasMoreRecords", resp_data.get("hasMore", False))
+            last_seen_id = resp_data.get("lastSeenAssetId", resp_data.get("lastId"))
+
+            # Fire the checkpoint callback AFTER we've updated our state for
+            # this page. If it raises, that's a caller bug — let it surface.
+            if on_page is not None:
+                try:
+                    on_page(page, len(all_assets), last_seen_id, bool(has_more))
+                except Exception as cb_err:
+                    logger.warning(
+                        f"CSAM on_page callback raised (ignored): {cb_err}"
+                    )
+
             if page % 10 == 0:
                 if expected:
                     logger.info(
@@ -855,9 +928,6 @@ class QualysClient:
                         f"  CSAM assets: fetched {len(all_assets)} so far "
                         f"(page {page})"
                     )
-
-            has_more = resp_data.get("hasMoreRecords", resp_data.get("hasMore", False))
-            last_seen_id = resp_data.get("lastSeenAssetId", resp_data.get("lastId"))
 
             if not has_more or not last_seen_id:
                 break

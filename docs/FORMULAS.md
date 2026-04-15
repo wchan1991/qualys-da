@@ -409,6 +409,13 @@ GFS retention:
 
 ---
 
+## Cache lifecycle
+
+### `invalidate_cache()`
+Not a metric — a cache-control hook. `AnalyticsEngine` memoises the `dashboard_summary()` payload and `db.get_latest_fetched_at()` lookups against a monotonically increasing generation counter so repeat dashboard hits are O(1) between refreshes. `DataManager.refresh_all()` (and the per-type refreshes) call this after saving new snapshots so the next page load reads fresh data. No SQL; pure in-memory reset of the generation/cache attributes.
+
+---
+
 <a id="recurring-check"></a>
 
 ## Recurring check

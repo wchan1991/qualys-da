@@ -22,18 +22,62 @@ class AnalyticsEngine:
     def __init__(self, db: QualysDADatabase, config: QualysDAConfig):
         self.db = db
         self.config = config
+        # Generation-based cache. `invalidate_cache()` bumps the generation,
+        # which logically empties every cache without having to walk them.
+        # Refresh pipelines call invalidate_cache() after a successful pull
+        # so the next dashboard hit repopulates from fresh data.
+        self._generation: int = 0
+        self._fetched_at_cache: Dict[str, Optional[str]] = {}
+        self._dashboard_cache: Optional[Dict[str, Any]] = None
+        self._dashboard_cache_gen: int = -1
+
+    def invalidate_cache(self) -> None:
+        """Bump the generation counter and drop memoised dashboard payloads.
+
+        Called by `DataManager` at the end of every successful refresh so the
+        next page load reads live data. Cheap — just resets a few attributes.
+        """
+        self._generation += 1
+        self._fetched_at_cache.clear()
+        self._dashboard_cache = None
+        self._dashboard_cache_gen = -1
+
+    def _fetched_at(self, table: str) -> Optional[str]:
+        """Memoised `db.get_latest_fetched_at(table)`.
+
+        The raw helper is called 30+ times per dashboard render (every
+        analytics method asks for it). Caching it for the life of a
+        generation collapses those into one query per table per refresh.
+        """
+        if table not in self._fetched_at_cache:
+            self._fetched_at_cache[table] = self.db.get_latest_fetched_at(table)
+        return self._fetched_at_cache[table]
 
     # ── Dashboard ────────────────────────────────────────────────
 
     def dashboard_summary(self) -> Dict[str, Any]:
-        """Compose all overview metrics for the dashboard page."""
-        return {
+        """Compose all overview metrics for the dashboard page.
+
+        Result is cached until the next refresh (`invalidate_cache()`).
+        A cold dashboard now pays ~5 queries; warm hits are O(1).
+        """
+        if (self._dashboard_cache is not None
+                and self._dashboard_cache_gen == self._generation):
+            return self._dashboard_cache
+
+        # Compute asset_coverage once and pass it to kpi_badges so we don't
+        # run the same set-arithmetic twice per dashboard render.
+        coverage = self.asset_coverage()
+        payload = {
             "vuln_overview": self.vuln_overview(),
-            "kpi_badges": self.kpi_badges(),
-            "asset_coverage": self.asset_coverage(),
+            "kpi_badges": self.kpi_badges(coverage=coverage),
+            "asset_coverage": coverage,
             "risk_distribution": self.risk_distribution(),
             "last_refresh": self._last_refresh_info(),
         }
+        self._dashboard_cache = payload
+        self._dashboard_cache_gen = self._generation
+        return payload
 
     def _last_refresh_info(self) -> Optional[Dict]:
         logs = self.db.get_refresh_log(limit=1)
@@ -42,7 +86,7 @@ class AnalyticsEngine:
     # ── Vulnerability Overview ───────────────────────────────────
 
     def vuln_overview(self, include_disabled: bool = False) -> Dict[str, Any]:
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return {"total": 0, "by_severity": {}, "by_status": {}, "critical_count": 0}
 
@@ -89,8 +133,8 @@ class AnalyticsEngine:
     # ── Risk Distribution ────────────────────────────────────────
 
     def risk_distribution(self) -> Dict[str, Any]:
-        fetched_hosts = self.db.get_latest_fetched_at("vm_hosts")
-        fetched_det = self.db.get_latest_fetched_at("vm_detections")
+        fetched_hosts = self._fetched_at("vm_hosts")
+        fetched_det = self._fetched_at("vm_detections")
 
         # TruRisk histogram (buckets of 100)
         trurisk_hist = []
@@ -139,8 +183,8 @@ class AnalyticsEngine:
     # ── Asset Coverage ───────────────────────────────────────────
 
     def asset_coverage(self) -> Dict[str, Any]:
-        csam_fetched = self.db.get_latest_fetched_at("csam_assets")
-        vm_fetched = self.db.get_latest_fetched_at("vm_hosts")
+        csam_fetched = self._fetched_at("csam_assets")
+        vm_fetched = self._fetched_at("vm_hosts")
 
         csam_ips = set()
         vm_ips = set()
@@ -197,7 +241,7 @@ class AnalyticsEngine:
     # ── Detection Age ────────────────────────────────────────────
 
     def detection_age(self) -> Dict[str, Any]:
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return {"mean_days_to_remediate": 0, "aging_30d": 0, "aging_60d": 0, "aging_90d": 0}
 
@@ -231,8 +275,8 @@ class AnalyticsEngine:
     # ── OS Distribution ──────────────────────────────────────────
 
     def os_distribution(self) -> List[Dict]:
-        fetched_det = self.db.get_latest_fetched_at("vm_detections")
-        fetched_hosts = self.db.get_latest_fetched_at("vm_hosts")
+        fetched_det = self._fetched_at("vm_detections")
+        fetched_hosts = self._fetched_at("vm_hosts")
         if not fetched_det or not fetched_hosts:
             return []
 
@@ -263,8 +307,8 @@ class AnalyticsEngine:
 
     def app_distribution(self) -> List[Dict]:
         """Vuln density by application from CSAM software inventory."""
-        csam_fetched = self.db.get_latest_fetched_at("csam_assets")
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
+        csam_fetched = self._fetched_at("csam_assets")
+        det_fetched = self._fetched_at("vm_detections")
         if not csam_fetched or not det_fetched:
             return []
 
@@ -315,7 +359,7 @@ class AnalyticsEngine:
     # ── Top QIDs ─────────────────────────────────────────────────
 
     def top_qids(self, n: int = 20) -> List[Dict]:
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return []
         rows = self.db.conn.execute(
@@ -352,7 +396,7 @@ class AnalyticsEngine:
             rows. Intentionally narrower than vuln_overview.total which counts
             ALL non-disabled detections including Fixed.
         """
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return {
                 "summary": {"resources_scanned": 0, "total_hosts": 0, "coverage_pct": 0,
@@ -506,8 +550,8 @@ class AnalyticsEngine:
         Uses the same IP-to-group resolution as cyber_six_pack_trend so the
         6-Pack page is internally consistent.
         """
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
-        host_fetched = self.db.get_latest_fetched_at("vm_hosts")
+        det_fetched = self._fetched_at("vm_detections")
+        host_fetched = self._fetched_at("vm_hosts")
         if not det_fetched:
             return {"groups": [], "enterprise": {}}
 
@@ -670,7 +714,7 @@ class AnalyticsEngine:
 
     def _resolve_group_ips(self, group_by: str) -> Dict[str, List[str]]:
         """Shared helper — maps group name -> list of IPs for owner/BU/tag/OS."""
-        host_fetched = self.db.get_latest_fetched_at("vm_hosts")
+        host_fetched = self._fetched_at("vm_hosts")
         group_ips: Dict[str, List[str]] = {}
         if group_by == "tag":
             for r in self.db.conn.execute(
@@ -796,7 +840,7 @@ class AnalyticsEngine:
         net_arr = [n - f + r for n, f, r in zip(new_arr, fixed_arr, reopened_arr)]
 
         # Current Active (= the right anchor)
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
+        det_fetched = self._fetched_at("vm_detections")
         end_active = 0
         if det_fetched:
             active_params: List = [det_fetched]
@@ -855,8 +899,8 @@ class AnalyticsEngine:
         OS strings are normalized to their family (Windows/Linux/macOS/Other)
         to keep the chart readable.
         """
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
-        host_fetched = self.db.get_latest_fetched_at("vm_hosts")
+        det_fetched = self._fetched_at("vm_detections")
+        host_fetched = self._fetched_at("vm_hosts")
         if not det_fetched or not host_fetched:
             return {"groups": [], "oses": [], "matrix": []}
 
@@ -940,7 +984,7 @@ class AnalyticsEngine:
           }
         Scoped to OPEN detections (New/Active/Re-Opened, non-disabled).
         """
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return {
                 "severities": [1, 2, 3, 4, 5],
@@ -999,9 +1043,9 @@ class AnalyticsEngine:
         Returns list of hosts with CSAM/VM source, OS, last scan, TruRisk,
         open vuln count, and tags. Intended for the Orphaned Assets page.
         """
-        host_fetched = self.db.get_latest_fetched_at("vm_hosts")
-        csam_fetched = self.db.get_latest_fetched_at("csam_assets")
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
+        host_fetched = self._fetched_at("vm_hosts")
+        csam_fetched = self._fetched_at("csam_assets")
+        det_fetched = self._fetched_at("vm_detections")
 
         # Union of IPs across VM + CSAM
         ips_by_source: Dict[str, Dict[str, Any]] = {}
@@ -1076,19 +1120,26 @@ class AnalyticsEngine:
 
     # ── Operational KPIs ─────────────────────────────────────────
 
-    def kpi_badges(self) -> Dict[str, Any]:
-        """Compact KPI badges for the main dashboard."""
+    def kpi_badges(self, coverage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Compact KPI badges for the main dashboard.
+
+        `coverage` lets the caller (dashboard_summary) reuse a single
+        `asset_coverage()` computation across the whole page render instead
+        of running the (set-union-heavy) coverage query twice.
+        """
+        if coverage is None:
+            coverage = self.asset_coverage()
         return {
             "patchable_pct": self.patchable_percentage().get("patchable_pct", 0),
             "avg_mttr": self.detection_age().get("mean_days_to_remediate", 0),
             "sla_compliance_pct": self._overall_sla_compliance(),
-            "scan_coverage_pct": self.asset_coverage().get("scan_coverage_30d_pct", 0),
+            "scan_coverage_pct": coverage.get("scan_coverage_30d_pct", 0),
             "reopen_rate": self.reopen_rate().get("rate_pct", 0),
         }
 
     def patchable_percentage(self) -> Dict[str, Any]:
         """% of open vulns that are Confirmed (patchable) vs Potential."""
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return {"patchable": 0, "non_patchable": 0, "patchable_pct": 0}
         rows = self.db.conn.execute(
@@ -1109,7 +1160,7 @@ class AnalyticsEngine:
         }
 
     def mttr_by_severity(self) -> Dict[int, float]:
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return {}
         rows = self.db.conn.execute(
@@ -1124,47 +1175,62 @@ class AnalyticsEngine:
         return {r["severity"]: round(r["avg_days"], 1) if r["avg_days"] else 0 for r in rows}
 
     def sla_compliance(self) -> Dict[str, Any]:
-        """SLA compliance breakdown per severity."""
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        """SLA compliance breakdown per severity.
+
+        Previously 10 queries (2 per severity × 5 severities). Now a single
+        GROUP BY severity with a per-severity CASE that compares first_found
+        to that severity's SLA cutoff. The cutoff per severity is pre-computed
+        in Python and passed in as a bound param so SQLite can evaluate the
+        CASE branch-free.
+        """
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return {"by_severity": {}, "overall_pct": 0}
         sla_targets = self.db.get_sla_targets()
-        results = {}
-        total_compliant = 0
-        total_open = 0
 
+        # Per-severity SLA cutoff timestamps (detections first_found at or
+        # before this stamp have exceeded their SLA window).
+        cutoffs = {}
+        sla_days_map = {}
         for sev in range(1, 6):
             sla_days = sla_targets.get(sev, self.config.get_sla_days(sev))
-            cutoff = (datetime.utcnow() - timedelta(days=sla_days)).isoformat()
+            sla_days_map[sev] = sla_days
+            cutoffs[sev] = (datetime.utcnow() - timedelta(days=sla_days)).isoformat()
 
-            # Total open for this severity
-            row = self.db.conn.execute(
-                """SELECT COUNT(*) FROM vm_detections
-                   WHERE fetched_at = ? AND severity = ?
-                   AND status IN ('New','Active') AND is_disabled = 0""",
-                (fetched, sev),
-            ).fetchone()
-            open_count = row[0]
+        rows = self.db.conn.execute(
+            """SELECT severity,
+                      COUNT(*) AS open_count,
+                      SUM(CASE
+                          WHEN severity = 5 AND first_found <= ? THEN 1
+                          WHEN severity = 4 AND first_found <= ? THEN 1
+                          WHEN severity = 3 AND first_found <= ? THEN 1
+                          WHEN severity = 2 AND first_found <= ? THEN 1
+                          WHEN severity = 1 AND first_found <= ? THEN 1
+                          ELSE 0 END) AS breach_count
+               FROM vm_detections
+               WHERE fetched_at = ?
+                 AND status IN ('New','Active')
+                 AND is_disabled = 0
+               GROUP BY severity""",
+            (cutoffs[5], cutoffs[4], cutoffs[3], cutoffs[2], cutoffs[1], fetched),
+        ).fetchall()
 
-            # Breaching SLA (open longer than allowed)
-            row = self.db.conn.execute(
-                """SELECT COUNT(*) FROM vm_detections
-                   WHERE fetched_at = ? AND severity = ?
-                   AND status IN ('New','Active') AND is_disabled = 0
-                   AND first_found <= ?""",
-                (fetched, sev, cutoff),
-            ).fetchone()
-            breach_count = row[0]
-
+        by_sev_rows = {r["severity"]: r for r in rows}
+        results: Dict[int, Dict[str, Any]] = {}
+        total_compliant = 0
+        total_open = 0
+        for sev in range(1, 6):
+            r = by_sev_rows.get(sev)
+            open_count = r["open_count"] if r else 0
+            breach_count = r["breach_count"] if r else 0
             compliant = open_count - breach_count
             total_compliant += compliant
             total_open += open_count
-
             results[sev] = {
                 "total": open_count,
                 "compliant": compliant,
                 "breaching": breach_count,
-                "sla_days": sla_days,
+                "sla_days": sla_days_map[sev],
                 "compliance_pct": round(compliant / max(open_count, 1) * 100, 1),
             }
 
@@ -1172,8 +1238,9 @@ class AnalyticsEngine:
         return {"by_severity": results, "overall_pct": overall_pct}
 
     def _overall_sla_compliance(self) -> float:
-        result = self.sla_compliance()
-        return result.get("overall_pct", 0)
+        # sla_compliance is now a single query — no need for a cheaper
+        # shortcut variant.
+        return self.sla_compliance().get("overall_pct", 0)
 
     def scan_coverage(self) -> Dict[str, Any]:
         return self.asset_coverage()
@@ -1197,7 +1264,7 @@ class AnalyticsEngine:
         }
 
     def reopen_rate(self) -> Dict[str, Any]:
-        fetched = self.db.get_latest_fetched_at("vm_detections")
+        fetched = self._fetched_at("vm_detections")
         if not fetched:
             return {"reopened": 0, "total_fixed": 0, "rate_pct": 0}
         row = self.db.conn.execute(
@@ -1235,7 +1302,7 @@ class AnalyticsEngine:
 
     def tag_detail(self, tag_name: str) -> Dict[str, Any]:
         hosts = self.db.get_hosts_by_tag(tag_name, limit=500)
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
+        det_fetched = self._fetched_at("vm_detections")
         vuln_summary = {"total": 0, "by_severity": {}, "by_status": {}}
 
         if det_fetched and hosts:
@@ -1281,7 +1348,7 @@ class AnalyticsEngine:
 
     def ownership_summary(self) -> List[Dict]:
         """Per-owner metrics from current detection data."""
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
+        det_fetched = self._fetched_at("vm_detections")
         if not det_fetched:
             return []
 
@@ -1327,7 +1394,7 @@ class AnalyticsEngine:
 
     def cyber_six_pack(self, group_by: str = "owner") -> Dict[str, Any]:
         """Cyber 6-Pack view: weighted avg age + SLA breaches per group."""
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
+        det_fetched = self._fetched_at("vm_detections")
         if not det_fetched:
             return {"groups": [], "enterprise": {}}
 
@@ -1364,7 +1431,7 @@ class AnalyticsEngine:
           - sla_breaches (detections in that bucket whose age exceeds the per-severity SLA window)
         This yields a directional view of how each group's aging cohort has grown.
         """
-        det_fetched = self.db.get_latest_fetched_at("vm_detections")
+        det_fetched = self._fetched_at("vm_detections")
         if not det_fetched:
             return {"months": [], "groups": []}
 
@@ -1389,57 +1456,75 @@ class AnalyticsEngine:
             group_rows = self._six_pack_by_os(det_fetched, sla)
             group_ips = {g["name"]: self._ips_for_os(g["name"]) for g in group_rows[:8]}
         else:
-            # owner
-            host_fetched = self.db.get_latest_fetched_at("vm_hosts")
+            # owner — batch-resolve to avoid a per-IP DB trip per host (the
+            # trend view used to scale O(n_hosts) × months).
+            host_fetched = self._fetched_at("vm_hosts")
             group_ips = {}
             if host_fetched:
-                for r in self.db.conn.execute(
-                    "SELECT DISTINCT ip_address FROM vm_hosts WHERE fetched_at = ?",
-                    (host_fetched,),
-                ).fetchall():
-                    ip = r["ip_address"]
-                    resolved = self.db.get_asset_owner(ip)
-                    name = resolved["owner"] if resolved else "Unassigned"
-                    group_ips.setdefault(name, []).append(ip)
+                all_ips = [
+                    r["ip_address"] for r in self.db.conn.execute(
+                        "SELECT DISTINCT ip_address FROM vm_hosts WHERE fetched_at = ?",
+                        (host_fetched,),
+                    ).fetchall()
+                ]
+                resolved_groups = self._group_ips_by_owner(all_ips)
+                group_ips = {name: info["ips"] for name, info in resolved_groups.items()}
             # Keep top 8 groups by IP count so charts stay readable
             group_ips = dict(sorted(group_ips.items(), key=lambda kv: len(kv[1]), reverse=True)[:8])
 
-        # For each group, compute per-month metrics by first_found bucket
+        # For each group, compute per-month metrics by first_found bucket.
+        # We push bucketing + aggregation into SQL so we stream O(months)
+        # rows out per group instead of O(n_detections) across the wire and
+        # re-summing them in Python. At production scale each group can have
+        # 100k+ detections; the old path pulled every row back, the new one
+        # pulls ≤ months_back rows.
         groups_out: List[Dict] = []
+        # SLA window per severity — used inline in the CASE below.
+        sla5, sla4, sla3, sla2, sla1 = (sla.get(s, 365) for s in (5, 4, 3, 2, 1))
         for name, ips in group_ips.items():
             if not ips:
                 continue
             ph = ",".join("?" * len(ips))
             rows = self.db.conn.execute(
-                f"""SELECT substr(first_found, 1, 7) AS ym, severity,
-                           julianday('now') - julianday(first_found) AS age_days
+                f"""SELECT substr(first_found, 1, 7) AS ym,
+                           AVG(julianday('now') - julianday(first_found)) AS avg_age,
+                           COUNT(*) AS cnt,
+                           SUM(CASE
+                               WHEN severity = 5
+                                    AND (julianday('now') - julianday(first_found)) > ? THEN 1
+                               WHEN severity = 4
+                                    AND (julianday('now') - julianday(first_found)) > ? THEN 1
+                               WHEN severity = 3
+                                    AND (julianday('now') - julianday(first_found)) > ? THEN 1
+                               WHEN severity = 2
+                                    AND (julianday('now') - julianday(first_found)) > ? THEN 1
+                               WHEN severity = 1
+                                    AND (julianday('now') - julianday(first_found)) > ? THEN 1
+                               ELSE 0 END) AS breach_count
                     FROM vm_detections
                     WHERE fetched_at = ? AND ip_address IN ({ph})
                       AND status IN ('New','Active') AND is_disabled = 0
-                      AND first_found != ''""",
-                [det_fetched] + ips,
+                      AND first_found != ''
+                    GROUP BY ym""",
+                [sla5, sla4, sla3, sla2, sla1, det_fetched] + ips,
             ).fetchall()
 
-            age_buckets: Dict[str, List[float]] = {m: [] for m in months}
-            breach_buckets: Dict[str, int] = {m: 0 for m in months}
-            count_buckets: Dict[str, int] = {m: 0 for m in months}
-            for r in rows:
-                ym = r["ym"]
-                if ym not in age_buckets:
-                    continue  # detection first_found outside the window
-                age = r["age_days"] or 0
-                age_buckets[ym].append(age)
-                count_buckets[ym] += 1
-                sla_days = sla.get(r["severity"], 365)
-                if age > sla_days:
-                    breach_buckets[ym] += 1
-
+            # Key by month; fill missing months with zero so the chart x-axis
+            # aligns across groups.
+            by_month = {r["ym"]: r for r in rows}
             avg_age_series = [
-                round(sum(age_buckets[m]) / len(age_buckets[m]), 1) if age_buckets[m] else 0
+                round(by_month[m]["avg_age"], 1)
+                if m in by_month and by_month[m]["avg_age"] is not None else 0
                 for m in months
             ]
-            sla_series = [breach_buckets[m] for m in months]
-            total_series = [count_buckets[m] for m in months]
+            sla_series = [
+                by_month[m]["breach_count"] if m in by_month else 0
+                for m in months
+            ]
+            total_series = [
+                by_month[m]["cnt"] if m in by_month else 0
+                for m in months
+            ]
             groups_out.append({
                 "name": name,
                 "avg_age": avg_age_series,
@@ -1454,7 +1539,7 @@ class AnalyticsEngine:
         return [h["ip_address"] for h in hosts if h.get("ip_address")]
 
     def _ips_for_os(self, os_name: str) -> List[str]:
-        fetched = self.db.get_latest_fetched_at("vm_hosts")
+        fetched = self._fetched_at("vm_hosts")
         if not fetched:
             return []
         rows = self.db.conn.execute(
@@ -1463,40 +1548,146 @@ class AnalyticsEngine:
         ).fetchall()
         return [r["ip_address"] for r in rows]
 
+    def _batch_resolve_owners(self, ips: List[str]) -> Dict[str, Dict[str, str]]:
+        """Resolve owner + business_unit for a list of IPs in O(N) DB trips.
+
+        Mirrors `db.get_asset_owner`'s precedence — direct IP → IP range →
+        host tag → OS pattern — but fetches every rule table once and every
+        host-scoped fact (tags, OS) once, then does the matching in Python.
+        At production scale (104k VM hosts) this collapses ~104k sequential
+        queries into ~5, which was the single biggest hit on the 6-Pack page.
+
+        Unmatched IPs are omitted from the result; callers should treat a
+        missing key as "Unassigned".
+        """
+        import ipaddress as ipm
+
+        # One fetch per match_type. Keeps query count O(1) regardless of |ips|.
+        rule_rows = self.db.conn.execute(
+            "SELECT match_type, match_value, owner, business_unit FROM asset_owners"
+        ).fetchall()
+        ip_rules: Dict[str, Dict[str, str]] = {}
+        range_rules: List[Dict[str, Any]] = []
+        tag_rules: Dict[str, Dict[str, str]] = {}
+        os_rules: List[Dict[str, Any]] = []
+        for r in rule_rows:
+            entry = {"owner": r["owner"], "business_unit": r["business_unit"] or ""}
+            mt = r["match_type"]
+            if mt == "ip":
+                ip_rules[r["match_value"]] = entry
+            elif mt == "ip_range":
+                try:
+                    range_rules.append({
+                        "network": ipm.ip_network(r["match_value"], strict=False),
+                        **entry,
+                    })
+                except ValueError:
+                    continue
+            elif mt == "tag":
+                tag_rules[r["match_value"]] = entry
+            elif mt == "os_pattern":
+                os_rules.append({
+                    "pattern": r["match_value"].replace("%", "").lower(),
+                    **entry,
+                })
+
+        # Lazy-load tag / OS facts only if any rule type might need them.
+        ip_tags: Dict[str, set] = {}
+        if tag_rules:
+            tag_fetched = self._fetched_at("host_tags")
+            if tag_fetched:
+                for r in self.db.conn.execute(
+                    "SELECT ip_address, tag_name FROM host_tags WHERE fetched_at = ?",
+                    (tag_fetched,),
+                ).fetchall():
+                    ip_tags.setdefault(r["ip_address"], set()).add(r["tag_name"])
+
+        ip_os: Dict[str, str] = {}
+        if os_rules:
+            host_fetched = self._fetched_at("vm_hosts")
+            if host_fetched:
+                for r in self.db.conn.execute(
+                    "SELECT ip_address, os FROM vm_hosts WHERE fetched_at = ? AND os != ''",
+                    (host_fetched,),
+                ).fetchall():
+                    ip_os[r["ip_address"]] = r["os"]
+
+        resolved: Dict[str, Dict[str, str]] = {}
+        for ip in ips:
+            # 1. direct IP
+            if ip in ip_rules:
+                resolved[ip] = ip_rules[ip]
+                continue
+            # 2. IP range
+            addr = None
+            if range_rules:
+                try:
+                    addr = ipm.ip_address(ip)
+                except ValueError:
+                    addr = None
+                if addr is not None:
+                    hit = next((r for r in range_rules if addr in r["network"]), None)
+                    if hit:
+                        resolved[ip] = {"owner": hit["owner"], "business_unit": hit["business_unit"]}
+                        continue
+            # 3. tag-based
+            if tag_rules:
+                tags = ip_tags.get(ip, set())
+                hit_name = next((t for t in tags if t in tag_rules), None)
+                if hit_name:
+                    resolved[ip] = tag_rules[hit_name]
+                    continue
+            # 4. OS pattern
+            if os_rules:
+                host_os = ip_os.get(ip, "").lower()
+                if host_os:
+                    hit = next((r for r in os_rules if r["pattern"] in host_os), None)
+                    if hit:
+                        resolved[ip] = {"owner": hit["owner"], "business_unit": hit["business_unit"]}
+                        continue
+        return resolved
+
+    def _group_ips_by_owner(self, ips: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Batch-group a list of IPs by resolved owner (Unassigned for misses).
+
+        Returns `{owner_name: {"ips": [...], "business_unit": "..."}}`.
+        """
+        resolved = self._batch_resolve_owners(ips)
+        groups: Dict[str, Dict[str, Any]] = {}
+        for ip in ips:
+            entry = resolved.get(ip)
+            name = entry["owner"] if entry else "Unassigned"
+            bu = entry["business_unit"] if entry else ""
+            g = groups.setdefault(name, {"ips": [], "business_unit": bu})
+            g["ips"].append(ip)
+        return groups
+
     def _six_pack_by_owner(self, fetched: str, sla: Dict) -> List[Dict]:
         # Get all VM host IPs, resolve each to an owner, group by owner
-        host_fetched = self.db.get_latest_fetched_at("vm_hosts")
+        host_fetched = self._fetched_at("vm_hosts")
         if not host_fetched:
             return []
         rows = self.db.conn.execute(
             "SELECT DISTINCT ip_address FROM vm_hosts WHERE fetched_at = ?",
             (host_fetched,),
         ).fetchall()
+        all_ips = [r["ip_address"] for r in rows]
 
-        # Build owner → [ips] map
-        owner_ips: Dict[str, list] = {}
-        owner_bu: Dict[str, str] = {}
-        for r in rows:
-            ip = r["ip_address"]
-            resolved = self.db.get_asset_owner(ip)
-            if resolved:
-                name = resolved["owner"]
-                owner_ips.setdefault(name, []).append(ip)
-                owner_bu[name] = resolved.get("business_unit", "")
-            else:
-                owner_ips.setdefault("Unassigned", []).append(ip)
+        # Batch-resolve owners in one pass (vs. the old per-IP query loop).
+        owner_groups = self._group_ips_by_owner(all_ips)
 
         groups = []
-        for owner_name, ips in owner_ips.items():
+        for owner_name, info in owner_groups.items():
+            ips = info["ips"]
             metrics = self._six_pack_metrics_for_ips(fetched, ips, sla)
             metrics["name"] = owner_name
-            metrics["business_unit"] = owner_bu.get(owner_name, "")
+            metrics["business_unit"] = info["business_unit"]
             metrics["host_count"] = len(ips)
             groups.append(metrics)
         return sorted(groups, key=lambda x: x["total_vulns"], reverse=True)
 
     def _six_pack_by_tag(self, fetched: str, sla: Dict) -> List[Dict]:
-        tag_fetched = self.db.get_latest_fetched_at("host_tags")
+        tag_fetched = self._fetched_at("host_tags")
         if not tag_fetched:
             return []
         tags = self.db.get_all_tags()
@@ -1513,7 +1704,7 @@ class AnalyticsEngine:
         return sorted(groups, key=lambda x: x["total_vulns"], reverse=True)
 
     def _six_pack_by_os(self, fetched: str, sla: Dict) -> List[Dict]:
-        host_fetched = self.db.get_latest_fetched_at("vm_hosts")
+        host_fetched = self._fetched_at("vm_hosts")
         if not host_fetched:
             return []
         rows = self.db.conn.execute(
@@ -1539,36 +1730,36 @@ class AnalyticsEngine:
     def _six_pack_metrics_for_ips(self, fetched: str, ips: List[str], sla: Dict) -> Dict:
         placeholders = ",".join("?" * len(ips))
 
-        # Weighted average age
+        # Precompute per-severity SLA cutoff timestamps so the breach check
+        # can be folded into the same aggregation query as total + weighted age.
+        # Was: 6 queries (1 age + 5 severity). Now: 1 query.
+        cutoffs = {
+            sev: (datetime.utcnow() - timedelta(days=sla.get(sev, 365))).isoformat()
+            for sev in range(1, 6)
+        }
         row = self.db.conn.execute(
             f"""SELECT
-                  SUM((julianday('now') - julianday(first_found))) as total_age,
-                  COUNT(*) as cnt
+                  SUM(julianday('now') - julianday(first_found)) AS total_age,
+                  COUNT(*) AS cnt,
+                  SUM(CASE
+                      WHEN severity = 5 AND first_found <= ? THEN 1
+                      WHEN severity = 4 AND first_found <= ? THEN 1
+                      WHEN severity = 3 AND first_found <= ? THEN 1
+                      WHEN severity = 2 AND first_found <= ? THEN 1
+                      WHEN severity = 1 AND first_found <= ? THEN 1
+                      ELSE 0 END) AS breach_count
                 FROM vm_detections
                 WHERE fetched_at = ? AND ip_address IN ({placeholders})
-                AND status IN ('New','Active') AND is_disabled = 0
-                AND first_found != ''""",
-            [fetched] + ips,
+                  AND status IN ('New','Active') AND is_disabled = 0
+                  AND first_found != ''""",
+            [cutoffs[5], cutoffs[4], cutoffs[3], cutoffs[2], cutoffs[1], fetched] + ips,
         ).fetchone()
         total_vulns = row["cnt"] or 0
         weighted_age = round((row["total_age"] or 0) / max(total_vulns, 1), 1)
-
-        # SLA breaching
-        breach_count = 0
-        for sev in range(1, 6):
-            sla_days = sla.get(sev, 365)
-            cutoff = (datetime.utcnow() - timedelta(days=sla_days)).isoformat()
-            br = self.db.conn.execute(
-                f"""SELECT COUNT(*) FROM vm_detections
-                    WHERE fetched_at = ? AND ip_address IN ({placeholders})
-                    AND severity = ? AND status IN ('New','Active')
-                    AND is_disabled = 0 AND first_found <= ?""",
-                [fetched] + ips + [sev, cutoff],
-            ).fetchone()
-            breach_count += br[0]
+        breach_count = row["breach_count"] or 0
 
         # Average TruRisk score for hosts in the group
-        host_fetched = self.db.get_latest_fetched_at("vm_hosts")
+        host_fetched = self._fetched_at("vm_hosts")
         avg_trurisk = None
         if host_fetched:
             tr_row = self.db.conn.execute(
@@ -1653,7 +1844,7 @@ class AnalyticsEngine:
         ).fetchone()[0]
 
         # TruRisk stats
-        fetched_hosts = self.db.get_latest_fetched_at("vm_hosts")
+        fetched_hosts = self._fetched_at("vm_hosts")
         avg_trurisk = 0
         max_trurisk = 0
         if fetched_hosts:
@@ -1665,7 +1856,7 @@ class AnalyticsEngine:
             max_trurisk = row["max_tr"] or 0
 
         # QDS average
-        fetched_det = self.db.get_latest_fetched_at("vm_detections")
+        fetched_det = self._fetched_at("vm_detections")
         avg_qds = 0
         if fetched_det:
             row = self.db.conn.execute(
