@@ -844,6 +844,45 @@ def api_refresh_log():
     return get_manager().db.get_refresh_log(limit)
 
 
+@app.route("/api/refresh-status")
+@api_response
+def api_refresh_status():
+    """Powers the dashboard's in-progress banner.
+
+    Returns the most recent refresh_log row with status='running' (plus
+    live counts + expected volumes so the poller can render a progress
+    line), or the most recent terminal row within the last 10 seconds
+    so the banner can flash a final state before dismissing. Returns
+    ``None`` when there's no interesting state to show.
+    """
+    db = get_manager().db
+    rows = db.get_refresh_log(limit=1)
+    if not rows:
+        return None
+    row = rows[0]
+    # Only surface running rows or rows that just completed. Past that
+    # the dashboard should look idle.
+    if row.get("status") != "running":
+        completed_at = row.get("completed_at")
+        if not completed_at:
+            return None
+        try:
+            delta = (
+                datetime.utcnow() - datetime.fromisoformat(completed_at)
+            ).total_seconds()
+        except (ValueError, TypeError):
+            return None
+        # 10s grace window — long enough for the banner to show the
+        # final state, short enough to auto-idle on reload.
+        if delta > 10:
+            return None
+
+    # Include the last successful snapshot timestamp so the banner can
+    # say "showing last snapshot from <time>" while the new pull runs.
+    row["last_success_fetched_at"] = db.get_latest_fetched_at("csam_assets")
+    return row
+
+
 # ============================================================
 # ERROR HANDLERS
 # ============================================================

@@ -53,10 +53,11 @@
                     <th>CSAM</th>
                     <th>Hosts</th>
                     <th>Detections</th>
+                    <th title="Per-API outcome — click the matching Refresh button above to retry a failed API">Per-API</th>
                 </tr>
             </thead>
             <tbody id="refresh-log-body">
-                <tr><td colspan="7" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
+                <tr><td colspan="8" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
             </tbody>
         </table>
     </div>
@@ -100,19 +101,34 @@ async function loadRefreshLog() {
     const data = await fetchApi('/api/refresh-log');
     const tbody = document.getElementById('refresh-log-body');
     if (!data || !data.length) {
-        tbody.innerHTML = '<tr><td colspan="7" style="color:var(--text-muted);padding:20px;text-align:center;">No refreshes recorded yet</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-muted);padding:20px;text-align:center;">No refreshes recorded yet</td></tr>';
         return;
     }
+    // Compact per-API summary cell — tells the operator which specific
+    // API needs re-running when `status === 'partial'`. Icons mirror the
+    // in-progress banner so the two surfaces look consistent.
+    const apiIcon = (s) => s === 'success' ? '&#10003;'
+                         : s === 'partial' ? '&#9888;'
+                         : s === 'failed'  ? '&#10007;'
+                         : s === 'skipped' ? '&mdash;'
+                         : '&middot;';
     tbody.innerHTML = data.slice(0, 15).map(r => {
-        const cls = r.status === 'success' ? 'badge-low' : r.status === 'failed' ? 'badge-critical' : 'badge-info';
+        const cls = r.status === 'success' ? 'badge-low'
+                  : r.status === 'failed'  ? 'badge-critical'
+                  : r.status === 'partial' ? 'badge-medium'
+                  : 'badge-info';
+        const perApi = `<span title="CSAM">${apiIcon(r.csam_status)} C</span>
+                      &middot; <span title="VM Hosts">${apiIcon(r.vm_host_status)} H</span>
+                      &middot; <span title="VM Detections">${apiIcon(r.vm_detection_status)} D</span>`;
         return `<tr>
             <td>${(r.started_at || '').slice(0, 16)}</td>
             <td>${(r.completed_at || '').slice(0, 16)}</td>
             <td>${r.source || ''}</td>
-            <td><span class="badge ${cls}">${r.status || ''}</span></td>
+            <td><span class="badge ${cls}" title="${(r.error || '').replace(/"/g,'&quot;')}">${r.status || ''}</span></td>
             <td>${(r.csam_count || 0).toLocaleString()}</td>
             <td>${(r.vm_host_count || 0).toLocaleString()}</td>
             <td>${(r.vm_detection_count || 0).toLocaleString()}</td>
+            <td style="font-family:monospace;font-size:12px;">${perApi}</td>
         </tr>`;
     }).join('');
     if (data[0] && data[0].completed_at) {

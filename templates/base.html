@@ -51,6 +51,18 @@
         </div>
     </nav>
 
+    <!-- Refresh-in-progress banner: populated by refreshStatusPoller() in
+         app.js. Shows live per-API counts while a refresh runs and flashes
+         the final state for a few seconds afterwards, so the operator
+         never looks at a stale dashboard without knowing a pull is in
+         flight. -->
+    <div id="refresh-banner" class="refresh-banner" style="display:none;">
+        <span id="refresh-banner-text"></span>
+        <button type="button" class="refresh-banner-close"
+                onclick="document.getElementById('refresh-banner').style.display='none';"
+                aria-label="Dismiss">&times;</button>
+    </div>
+
     <main class="container">
         {% block content %}{% endblock %}
     </main>

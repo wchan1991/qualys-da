@@ -81,6 +81,65 @@ async function checkConnection() {
 checkConnection();
 setInterval(checkConnection, 60000);
 
+// ── Refresh-in-progress Banner ───────────────────────────────
+// Polls /api/refresh-status every 3s. When a pull is running, shows
+// live per-API progress. When one flips to terminal, shows the final
+// per-API outcome for 8s before hiding — so the operator never stares
+// at a stale dashboard wondering whether the last Refresh click took.
+function fmtApiBadge(label, status, count, expected) {
+    const icon = (status === 'success') ? '&#10003;'
+               : (status === 'partial') ? '&#9888;'
+               : (status === 'failed')  ? '&#10007;'
+               : '&middot;';
+    const countStr = (count != null)
+        ? (expected ? `${formatNumber(count)}/${formatNumber(expected)}`
+                    : formatNumber(count))
+        : '--';
+    return `<span class="refresh-api refresh-api-${status || 'pending'}">${icon} ${label} ${countStr}</span>`;
+}
+
+async function pollRefreshStatus() {
+    const banner = document.getElementById('refresh-banner');
+    const txt = document.getElementById('refresh-banner-text');
+    if (!banner || !txt) return;
+
+    let row;
+    try {
+        const resp = await fetch('/api/refresh-status');
+        if (!resp.ok) return;
+        row = await resp.json();
+    } catch { return; }
+
+    if (!row) {
+        banner.style.display = 'none';
+        banner.className = 'refresh-banner';
+        return;
+    }
+
+    const running = row.status === 'running';
+    const badges = [
+        fmtApiBadge('CSAM', running ? 'pending' : row.csam_status,
+                    row.csam_count, row.csam_expected),
+        fmtApiBadge('Hosts', running ? 'pending' : row.vm_host_status,
+                    row.vm_host_count, row.vm_host_expected),
+        fmtApiBadge('Detections', running ? 'pending' : row.vm_detection_status,
+                    row.vm_detection_count, row.vm_detection_expected),
+    ].join(' · ');
+
+    const prefix = running
+        ? 'Refresh in progress — showing last snapshot'
+        : (row.status === 'partial'
+           ? 'Refresh completed with partial data'
+           : (row.status === 'failed' ? 'Refresh failed' : 'Refresh complete'));
+    txt.innerHTML = `<strong>${prefix}</strong> · ${badges}`;
+
+    banner.className = 'refresh-banner refresh-banner-' + (row.status || 'running');
+    banner.style.display = '';
+}
+
+pollRefreshStatus();
+setInterval(pollRefreshStatus, 3000);
+
 // ── Active Nav Highlight ─────────────────────────────────────
 function highlightNav() {
     const path = window.location.pathname;

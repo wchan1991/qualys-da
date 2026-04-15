@@ -321,32 +321,81 @@ class QualysClient:
             except (ValueError, AttributeError):
                 return None
 
+        limit = _int_header("X-RateLimit-Limit")
         remaining = _int_header("X-RateLimit-Remaining")
         to_wait = _int_header("X-RateLimit-ToWait-Sec")
         conc_limit = _int_header("X-Concurrency-Limit-Limit")
         conc_running = _int_header("X-Concurrency-Limit-Running")
 
+        # Three-tier pacing. Thresholds come from BACKLOG.md's planned
+        # behaviour: WARN at <50, slow-down at <=10, hard-wait at <=2.
+        # The point is to surface quota pressure in the logs _before_ it
+        # bites (operators can see the warning and schedule around it)
+        # rather than silently reaching into the ditch at Remaining=0.
+        #
+        # The low-quota WARN is emitted at most once per quota window so
+        # a 100-page pull doesn't produce 100 identical lines. We key on
+        # the window-end (now + ToWait-Sec) snapped to the nearest minute.
+        LOW_QUOTA_WARN = 50
+        SOFT_SLOW_DOWN = 10
+        HARD_WAIT = 2
+
         sleep_for = 0.0
         reason = None
+        log_level = "info"
 
         # Qualys returns ToWait-Sec > 0 when we're throttled *right now*.
         if to_wait is not None and to_wait > 0:
             sleep_for = float(to_wait)
             reason = f"server asked us to wait {to_wait}s (X-RateLimit-ToWait-Sec)"
-        # If we're within 2 calls of the budget, burn a small delay so the
+            log_level = "info"
+        # If we're within HARD_WAIT calls of the budget, use the server's
+        # ToWait-Sec if available; otherwise a small fixed delay so the
         # next page doesn't push us over.
-        elif remaining is not None and remaining <= 2:
-            sleep_for = 2.0
+        elif remaining is not None and remaining <= HARD_WAIT:
+            sleep_for = float(to_wait) if to_wait else 2.0
             reason = f"rate budget almost exhausted (Remaining={remaining})"
+            log_level = "info"
+        # Soft slow-down: inject a small delay per request when remaining
+        # is in the danger zone but not yet at the floor.
+        elif remaining is not None and remaining <= SOFT_SLOW_DOWN:
+            sleep_for = 0.5
+            reason = (f"rate budget low (Remaining={remaining}) — "
+                      f"slowing down to avoid 429")
+            log_level = "warning"
         # Concurrency saturated: brief pause lets in-flight calls drain.
         elif (conc_limit is not None and conc_running is not None
               and conc_running >= conc_limit):
             sleep_for = 1.0
             reason = (f"concurrency saturated "
                       f"({conc_running}/{conc_limit} in flight)")
+            log_level = "info"
+
+        # Dedup'd low-quota heads-up. Fires independently of whether we're
+        # already sleeping — the slow-down and hard-wait tiers handle
+        # *reactive* pacing; this warning exists so the operator sees
+        # quota pressure *before* it bites, so they can plan around it.
+        if remaining is not None and remaining < LOW_QUOTA_WARN:
+            # Key the dedup on the window-end: now + ToWait-Sec (rounded
+            # to the minute). New window → new warning.
+            window_key = None
+            if to_wait is not None:
+                window_key = int((time.time() + to_wait) // 60)
+            last_key = getattr(self, "_csam_low_quota_window", None)
+            if window_key != last_key:
+                self._csam_low_quota_window = window_key
+                logger.warning(
+                    f"CSAM quota low: {remaining} of "
+                    f"{limit if limit is not None else '?'} calls left"
+                    + (f", window resets in {to_wait}s" if to_wait else "")
+                )
 
         if sleep_for > 0:
-            logger.info(f"CSAM throttle: sleeping {sleep_for:.1f}s — {reason}")
+            msg = f"CSAM throttle: sleeping {sleep_for:.1f}s — {reason}"
+            if log_level == "warning":
+                logger.warning(msg)
+            else:
+                logger.info(msg)
             time.sleep(sleep_for)
 
     def _csam_request(self, method: str, endpoint: str,
@@ -380,13 +429,22 @@ class QualysClient:
             if response.status_code == 429:
                 # Server explicitly said stop. Honour Retry-After (RFC 7231)
                 # or Qualys's own X-RateLimit-ToWait-Sec, then retry once.
+                # When the server gave us an explicit number, trust it (up to
+                # a sane 15 min ceiling); only clamp to 120s if we had to fall
+                # back to the 30s default. A big tenant's burst-limit window
+                # can exceed 2 minutes, and retrying too early just eats the
+                # second 429 we only get one of.
                 retry_after = response.headers.get("Retry-After")
                 wait_hdr = response.headers.get("X-RateLimit-ToWait-Sec")
+                server_said = retry_after or wait_hdr
                 try:
-                    sleep_for = float(retry_after or wait_hdr or 30)
+                    sleep_for = float(server_said) if server_said else 30.0
                 except (TypeError, ValueError):
                     sleep_for = 30.0
-                sleep_for = max(1.0, min(sleep_for, 120.0))  # clamp
+                if server_said:
+                    sleep_for = max(1.0, min(sleep_for, 900.0))  # server-reported: trust up to 15 min
+                else:
+                    sleep_for = max(1.0, min(sleep_for, 120.0))  # default fallback: keep tight
                 logger.warning(
                     f"CSAM 429 — sleeping {sleep_for:.0f}s then retrying once "
                     f"(Retry-After={retry_after!r}, "
@@ -556,12 +614,19 @@ class QualysClient:
     # ── Fetch VM Hosts ───────────────────────────────────────────
 
     def fetch_vm_hosts(self, max_pages: int = 500,
-                       expected: Optional[int] = None) -> List[Dict]:
+                       expected: Optional[int] = None,
+                       on_page: Optional[Callable[..., None]] = None) -> List[Dict]:
         """Fetch all hosts from VM Host List API v3.
 
         If `expected` is given (from count_vm_hosts()), logs it upfront and
         warns if the fetched total drifts (catches silent truncation on
-        max_pages, rate-limit 429s, partial pagination, etc.)."""
+        max_pages, rate-limit 429s, partial pagination, etc.).
+
+        `on_page`, when provided, fires once per page with
+        ``(page_number, running_total, has_more, page_hosts)`` so callers
+        can live-update the refresh_log while the pull is still in flight.
+        Mirrors the CSAM fetcher's callback contract.
+        """
         if expected is not None:
             logger.info(f"Fetching VM hosts... (expected: {expected:,})")
         else:
@@ -586,6 +651,8 @@ class QualysClient:
             page += 1
             hosts = self._parse_vm_hosts_xml(response.text)
             all_hosts.extend(hosts)
+            next_url = self._get_pagination_url(response.text)
+            has_more = bool(next_url)
 
             if page % 10 == 0:
                 if expected:
@@ -598,8 +665,17 @@ class QualysClient:
                         f"  VM hosts: fetched {len(all_hosts)} so far (page {page})"
                     )
 
-            next_url = self._get_pagination_url(response.text)
-            if not next_url:
+            if on_page is not None:
+                try:
+                    on_page(page, len(all_hosts), has_more, hosts)
+                except Exception as cb_err:
+                    # Callback failure must not abort the pull — we log and
+                    # keep going. The refresh_log row may miss an update but
+                    # the terminal complete_refresh() still writes the final
+                    # count.
+                    logger.warning(f"VM hosts on_page callback raised: {cb_err}")
+
+            if not has_more:
                 break
 
             if self._rate_limiter:
@@ -653,11 +729,17 @@ class QualysClient:
     # ── Fetch VM Detections ──────────────────────────────────────
 
     def fetch_vm_detections(self, max_pages: int = 500,
-                            expected: Optional[int] = None) -> List[Dict]:
+                            expected: Optional[int] = None,
+                            on_page: Optional[Callable[..., None]] = None) -> List[Dict]:
         """Fetch all host detections from VM Detection API v5.
 
         If `expected` is given (from count_vm_detections()), logs it upfront
-        and warns if the fetched total drifts."""
+        and warns if the fetched total drifts.
+
+        `on_page`, when provided, fires once per page with
+        ``(page_number, running_total, has_more, page_detections)`` so the
+        Status Page can live-update while the pull is in flight.
+        """
         if expected is not None:
             logger.info(f"Fetching VM detections... (expected: {expected:,})")
         else:
@@ -682,6 +764,8 @@ class QualysClient:
             page += 1
             detections = self._parse_vm_detections_xml(response.text)
             all_detections.extend(detections)
+            next_url = self._get_pagination_url(response.text)
+            has_more = bool(next_url)
 
             if page % 10 == 0:
                 if expected:
@@ -695,8 +779,15 @@ class QualysClient:
                         f"(page {page})"
                     )
 
-            next_url = self._get_pagination_url(response.text)
-            if not next_url:
+            if on_page is not None:
+                try:
+                    on_page(page, len(all_detections), has_more, detections)
+                except Exception as cb_err:
+                    logger.warning(
+                        f"VM detections on_page callback raised: {cb_err}"
+                    )
+
+            if not has_more:
                 break
 
             if self._rate_limiter:
@@ -775,7 +866,8 @@ class QualysClient:
                           page_size: Optional[int] = None,
                           lookback_days: Optional[int] = None,
                           resume_from_id: Optional[str] = None,
-                          on_page: Optional[Callable[[int, int, Optional[str], bool], None]] = None
+                          on_page: Optional[Callable[..., None]] = None,
+                          on_filter_fallback: Optional[Callable[[], None]] = None,
                           ) -> List[Dict]:
         """Fetch assets from CSAM Asset Host Data API.
 
@@ -792,9 +884,15 @@ class QualysClient:
         resume_from_id : Qualys asset ID to pass as `startFromId` on the very
             first page. Used to resume after a rate-limited / crashed run.
         on_page : optional callback fired AFTER each successful page as
-            `on_page(page_num, assets_fetched_so_far, last_seen_id, has_more)`.
-            The caller uses this to persist a resume checkpoint after every
-            page, so even a kill-9 mid-pull leaves us resumable.
+            `on_page(page_num, assets_fetched_so_far, last_seen_id, has_more,
+            page_assets)`. The caller uses this to persist a resume checkpoint
+            *and* to write just-fetched assets to the DB under a stable
+            `fetched_at` — so a kill-9 mid-pull leaves us resumable AND with
+            the already-fetched rows durably saved.
+        on_filter_fallback : optional callback fired once if the lookback
+            filter is rejected and we retry without it. The caller uses this
+            to clear `lookback_days` from the checkpoint so a later resume
+            doesn't re-apply the bad filter.
 
         Returns the full list of asset dicts. If `RateLimitError` or any
         other exception bubbles up, `on_page` will already have been called
@@ -864,6 +962,13 @@ class QualysClient:
                     "if this tenant uses a different field name."
                 )
                 filter_enabled = False
+                if on_filter_fallback is not None:
+                    try:
+                        on_filter_fallback()
+                    except Exception as cb_err:
+                        logger.warning(
+                            f"CSAM on_filter_fallback callback raised (ignored): {cb_err}"
+                        )
                 page -= 1  # redo page 1 without filter
                 continue
 
@@ -887,6 +992,13 @@ class QualysClient:
                         f"without the lookback filter."
                     )
                     filter_enabled = False
+                    if on_filter_fallback is not None:
+                        try:
+                            on_filter_fallback()
+                        except Exception as cb_err:
+                            logger.warning(
+                                f"CSAM on_filter_fallback callback raised (ignored): {cb_err}"
+                            )
                     page -= 1
                     continue
                 raise QualysError(f"CSAM API error: {error_msg}")
@@ -908,10 +1020,14 @@ class QualysClient:
             last_seen_id = resp_data.get("lastSeenAssetId", resp_data.get("lastId"))
 
             # Fire the checkpoint callback AFTER we've updated our state for
-            # this page. If it raises, that's a caller bug — let it surface.
+            # this page. The callback gets this page's freshly-fetched assets
+            # so it can persist them to the DB under a stable snapshot
+            # fetched_at — mid-pull crashes then leave already-fetched rows
+            # durably saved, not just the progress pointer.
             if on_page is not None:
                 try:
-                    on_page(page, len(all_assets), last_seen_id, bool(has_more))
+                    on_page(page, len(all_assets), last_seen_id,
+                            bool(has_more), assets)
                 except Exception as cb_err:
                     logger.warning(
                         f"CSAM on_page callback raised (ignored): {cb_err}"

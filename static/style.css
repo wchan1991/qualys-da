@@ -461,3 +461,32 @@ a.metric-card:hover { border-color: var(--accent); transform: translateY(-1px); 
     .filter-panel { flex-direction: column; }
     .form-row { flex-direction: column; }
 }
+
+/* ── Refresh-in-progress banner (populated by pollRefreshStatus in app.js) ── */
+.refresh-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 16px;
+    font-size: 13px;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-secondary, #1e293b);
+    color: var(--text-primary, #f1f5f9);
+}
+.refresh-banner-running  { background: #1e3a8a; color: #dbeafe; }
+.refresh-banner-partial  { background: #78350f; color: #fed7aa; }
+.refresh-banner-failed   { background: #7f1d1d; color: #fecaca; }
+.refresh-banner-success  { background: #14532d; color: #bbf7d0; }
+.refresh-banner-close {
+    background: transparent; border: 0; color: inherit; cursor: pointer;
+    font-size: 18px; line-height: 1; padding: 0 4px;
+}
+.refresh-api {
+    display: inline-block; padding: 1px 6px; margin: 0 2px;
+    border-radius: 3px; font-family: monospace;
+}
+.refresh-api-success { color: #bbf7d0; }
+.refresh-api-partial { color: #fed7aa; }
+.refresh-api-failed  { color: #fecaca; }
+.refresh-api-pending { color: inherit; opacity: 0.9; }
