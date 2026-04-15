@@ -308,14 +308,23 @@ class QualysDADatabase:
                 vm_detection_expected INTEGER,
                 changes_detected INTEGER,
                 status TEXT NOT NULL,
-                error TEXT
+                error TEXT,
+                csam_status TEXT,
+                vm_host_status TEXT,
+                vm_detection_status TEXT
             )
         """)
-        # Idempotent migration for existing databases
+        # Idempotent migration for existing databases. Per-API status columns
+        # let the Status Page show which specific API failed so the operator
+        # knows which Refresh-<X> button to press to retry, without having to
+        # re-pull everything. See BACKLOG.md.
         for coldef in [
             "csam_expected INTEGER",
             "vm_host_expected INTEGER",
             "vm_detection_expected INTEGER",
+            "csam_status TEXT",
+            "vm_host_status TEXT",
+            "vm_detection_status TEXT",
         ]:
             col = coldef.split()[0]
             try:
@@ -338,9 +347,21 @@ class QualysDADatabase:
                 updated_at TEXT,
                 completed INTEGER DEFAULT 0,
                 lookback_days INTEGER,
-                note TEXT
+                note TEXT,
+                snapshot_fetched_at TEXT
             )
         """)
+        # Idempotent migration for databases created before snapshot_fetched_at
+        # was introduced. Without this column, a resumed pull would write the
+        # tail-half of the fleet under a *new* fetched_at and the dashboard
+        # would silently drop to half its host count. See BACKLOG.md.
+        try:
+            cursor.execute(
+                "ALTER TABLE csam_checkpoint ADD COLUMN snapshot_fetched_at TEXT"
+            )
+            logger.info("Migrated csam_checkpoint: added snapshot_fetched_at")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
         # ── Indexes ──────────────────────────────────────────────
         indexes = [
@@ -643,17 +664,61 @@ class QualysDADatabase:
                          status: str = "success", error: str = None,
                          csam_expected: Optional[int] = None,
                          vm_host_expected: Optional[int] = None,
-                         vm_detection_expected: Optional[int] = None):
+                         vm_detection_expected: Optional[int] = None,
+                         csam_status: Optional[str] = None,
+                         vm_host_status: Optional[str] = None,
+                         vm_detection_status: Optional[str] = None):
+        """Terminal write for a refresh. `status` is the row-level rollup;
+        `csam_status` / `vm_host_status` / `vm_detection_status` are the
+        per-API outcomes so the Status Page can show which specific pull
+        failed without forcing the operator to re-run everything.
+        """
         self.conn.execute(
             """UPDATE refresh_log
                SET completed_at=?, csam_count=?, vm_host_count=?,
                    vm_detection_count=?, changes_detected=?, status=?, error=?,
-                   csam_expected=?, vm_host_expected=?, vm_detection_expected=?
+                   csam_expected=?, vm_host_expected=?, vm_detection_expected=?,
+                   csam_status=?, vm_host_status=?, vm_detection_status=?
                WHERE id=?""",
             (datetime.utcnow().isoformat(), csam, vm_hosts, vm_detections,
              changes, status, error,
              csam_expected, vm_host_expected, vm_detection_expected,
+             csam_status, vm_host_status, vm_detection_status,
              refresh_id),
+        )
+        self.conn.commit()
+
+    def update_refresh_progress(self, refresh_id: int, *,
+                                csam_count: Optional[int] = None,
+                                vm_host_count: Optional[int] = None,
+                                vm_detection_count: Optional[int] = None,
+                                csam_expected: Optional[int] = None,
+                                vm_host_expected: Optional[int] = None,
+                                vm_detection_expected: Optional[int] = None) -> None:
+        """Mid-pull live update. Only the columns explicitly passed are
+        written; status stays 'running'. Called from the per-page callbacks
+        so the Status Page banner shows live progress instead of flipping
+        from 0 → final at the very end of a multi-minute pull.
+        """
+        sets = []
+        vals: list = []
+        for col, val in (
+            ("csam_count", csam_count),
+            ("vm_host_count", vm_host_count),
+            ("vm_detection_count", vm_detection_count),
+            ("csam_expected", csam_expected),
+            ("vm_host_expected", vm_host_expected),
+            ("vm_detection_expected", vm_detection_expected),
+        ):
+            if val is not None:
+                sets.append(f"{col}=?")
+                vals.append(val)
+        if not sets:
+            return
+        vals.append(refresh_id)
+        self.conn.execute(
+            f"UPDATE refresh_log SET {', '.join(sets)} WHERE id=?",
+            vals,
         )
         self.conn.commit()
 
@@ -666,7 +731,8 @@ class QualysDADatabase:
         """Return the current CSAM checkpoint row, or None if no pull has run."""
         row = self.conn.execute(
             "SELECT last_asset_id, assets_pulled, started_at, updated_at, "
-            "completed, lookback_days, note FROM csam_checkpoint WHERE id = 1"
+            "completed, lookback_days, note, snapshot_fetched_at "
+            "FROM csam_checkpoint WHERE id = 1"
         ).fetchone()
         if not row:
             return None
@@ -678,26 +744,39 @@ class QualysDADatabase:
             "completed": bool(row[4]),
             "lookback_days": row[5],
             "note": row[6],
+            "snapshot_fetched_at": row[7],
         }
+
+    # Sentinel distinguishing "caller didn't pass this field" from "caller
+    # explicitly wants this column set to NULL". `None` is a valid value we
+    # write on clean completion, so we can't overload it for "unchanged".
+    _UNSET = object()
 
     def update_csam_checkpoint(self, last_asset_id: Optional[str],
                                assets_pulled: int,
                                completed: bool,
                                lookback_days: Optional[int] = None,
                                started_at: Optional[str] = None,
-                               note: Optional[str] = None) -> None:
+                               note: Optional[str] = None,
+                               snapshot_fetched_at: Any = _UNSET) -> None:
         """Upsert the single checkpoint row. `started_at` is preserved across
-        updates when None — we only set it on the very first page of a run."""
+        updates when None — we only set it on the very first page of a run.
+
+        `snapshot_fetched_at` follows the same preservation rule but via an
+        explicit sentinel: omit the argument to keep the existing value;
+        pass `None` to clear it (on clean completion); pass a string to set it.
+        """
         now = datetime.utcnow().isoformat()
         existing = self.get_csam_checkpoint()
         if existing is None:
+            snap_value = None if snapshot_fetched_at is self._UNSET else snapshot_fetched_at
             self.conn.execute(
                 """INSERT INTO csam_checkpoint
                    (id, last_asset_id, assets_pulled, started_at, updated_at,
-                    completed, lookback_days, note)
-                   VALUES (1, ?, ?, ?, ?, ?, ?, ?)""",
+                    completed, lookback_days, note, snapshot_fetched_at)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (last_asset_id, assets_pulled, started_at or now, now,
-                 1 if completed else 0, lookback_days, note),
+                 1 if completed else 0, lookback_days, note, snap_value),
             )
         else:
             # Keep the original started_at unless the caller is explicitly
@@ -705,13 +784,19 @@ class QualysDADatabase:
             # next update is a fresh start; we detect that on the caller side
             # by passing started_at explicitly).
             preserved_start = started_at or existing["started_at"] or now
+            snap_value = (
+                existing.get("snapshot_fetched_at")
+                if snapshot_fetched_at is self._UNSET
+                else snapshot_fetched_at
+            )
             self.conn.execute(
                 """UPDATE csam_checkpoint
                    SET last_asset_id=?, assets_pulled=?, started_at=?,
-                       updated_at=?, completed=?, lookback_days=?, note=?
+                       updated_at=?, completed=?, lookback_days=?, note=?,
+                       snapshot_fetched_at=?
                    WHERE id=1""",
                 (last_asset_id, assets_pulled, preserved_start, now,
-                 1 if completed else 0, lookback_days, note),
+                 1 if completed else 0, lookback_days, note, snap_value),
             )
         self.conn.commit()
 
@@ -753,8 +838,9 @@ class QualysDADatabase:
         query = "SELECT * FROM vm_hosts WHERE fetched_at = ?"
         params: list = [fetched]
         if ip:
-            query += " AND ip_address LIKE ?"
-            params.append(f"%{ip}%")
+            query += " AND (ip_address LIKE ? OR dns LIKE ? OR netbios LIKE ?)"
+            like = f"%{ip}%"
+            params.extend([like, like, like])
         if os_filter:
             query += " AND os LIKE ?"
             params.append(f"%{os_filter}%")
