@@ -426,14 +426,25 @@ class QualysClient:
             # start collecting 429s half-way through pagination.
             if 200 <= response.status_code < 300:
                 self._csam_apply_server_throttle(response)
-            if response.status_code == 429:
-                # Server explicitly said stop. Honour Retry-After (RFC 7231)
-                # or Qualys's own X-RateLimit-ToWait-Sec, then retry once.
-                # When the server gave us an explicit number, trust it (up to
-                # a sane 15 min ceiling); only clamp to 120s if we had to fall
-                # back to the 30s default. A big tenant's burst-limit window
-                # can exceed 2 minutes, and retrying too early just eats the
-                # second 429 we only get one of.
+            # ── 429 multi-window-hop handler ─────────────────────
+            # When Qualys returns 429 with an explicit ToWait-Sec (or
+            # Retry-After), we sleep that long and retry — repeatedly,
+            # up to `csam_max_window_hops` times. This lets one
+            # `refresh_all()` wait through MULTIPLE rate-limit windows
+            # so a big tenant (e.g. 100k assets at 40k-per-window) can
+            # complete a full pull in a single unattended run, rather
+            # than needing manual re-triggers between windows.
+            #
+            # Per-page DB persistence (in fetch_csam_assets's on_page
+            # callback) means a crash during one of these long waits is
+            # still fully recoverable: the resumed run picks up from
+            # the same snapshot_fetched_at and the same last_asset_id
+            # that was checkpointed before we entered the wait.
+            max_hops = max(1, getattr(self.config, "csam_max_window_hops", 3))
+            max_wait = max(1, getattr(self.config, "csam_max_window_wait", 3600))
+            hop = 0
+            while response.status_code == 429 and hop < max_hops:
+                hop += 1
                 retry_after = response.headers.get("Retry-After")
                 wait_hdr = response.headers.get("X-RateLimit-ToWait-Sec")
                 server_said = retry_after or wait_hdr
@@ -442,11 +453,17 @@ class QualysClient:
                 except (TypeError, ValueError):
                     sleep_for = 30.0
                 if server_said:
-                    sleep_for = max(1.0, min(sleep_for, 900.0))  # server-reported: trust up to 15 min
+                    # Trust the server's reported wait, up to the configured
+                    # per-hop ceiling. Real Qualys window resets observed
+                    # at ~2810s; default ceiling of 3600s covers that.
+                    sleep_for = max(1.0, min(sleep_for, float(max_wait)))
                 else:
-                    sleep_for = max(1.0, min(sleep_for, 120.0))  # default fallback: keep tight
+                    # No server hint — keep the tight default-fallback clamp
+                    # so we don't sleep forever on a malformed response.
+                    sleep_for = max(1.0, min(sleep_for, 120.0))
                 logger.warning(
-                    f"CSAM 429 — sleeping {sleep_for:.0f}s then retrying once "
+                    f"CSAM 429 — window {hop}/{max_hops}: sleeping "
+                    f"{sleep_for:.0f}s then retrying "
                     f"(Retry-After={retry_after!r}, "
                     f"X-RateLimit-ToWait-Sec={wait_hdr!r})"
                 )
@@ -455,12 +472,17 @@ class QualysClient:
                     method=method, url=url, json=json_body, params=params,
                     timeout=timeout or self.config.timeout,
                 )
-                if response.status_code == 429:
-                    raise RateLimitError(
-                        "CSAM API rate limit exceeded — still 429 after retry"
-                    )
-                if 200 <= response.status_code < 300:
-                    self._csam_apply_server_throttle(response)
+            if response.status_code == 429:
+                raise RateLimitError(
+                    f"CSAM API rate limit exceeded — still 429 after "
+                    f"{max_hops} window-hop retries"
+                )
+            # If we hopped at least once and now have a 2xx, re-apply the
+            # throttle so the next request honours the fresh window's
+            # headers (the original throttle call above only fires on the
+            # first response, before any 429 hopping).
+            if hop > 0 and 200 <= response.status_code < 300:
+                self._csam_apply_server_throttle(response)
             if response.status_code >= 500:
                 raise QualysError(
                     f"CSAM API server error: {response.status_code}",

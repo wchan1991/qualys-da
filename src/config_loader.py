@@ -43,6 +43,15 @@ class QualysDAConfig:
                                     # 0 = no filter (pull everything).
     csam_resume_enabled: bool = True  # Resume from last asset ID if a prior pull
                                       # was interrupted (rate-limit / crash).
+    csam_max_window_hops: int = 3   # On 429, sleep ToWait-Sec and retry up to
+                                    # this many times — i.e. wait through up to
+                                    # N rate-limit windows in one refresh. Lets
+                                    # a single refresh complete a 100k+ pull
+                                    # that exceeds Qualys's per-window cap.
+    csam_max_window_wait: int = 3600  # Per-hop wait ceiling (sec). Clamps a
+                                      # malformed/extreme ToWait-Sec value so
+                                      # one stuck call can't hang the refresh
+                                      # for hours.
 
     # Database
     db_path: str = "data/qualys_da.db"
@@ -202,6 +211,8 @@ def load_config(config_path: Optional[Path] = None) -> QualysDAConfig:
         csam_page_size=get_int("api", "csam_page_size", 1000),
         csam_lookback_days=get_int("api", "csam_lookback_days", 90),
         csam_resume_enabled=get_bool("api", "csam_resume_enabled", True),
+        csam_max_window_hops=get_int("api", "csam_max_window_hops", 3),
+        csam_max_window_wait=get_int("api", "csam_max_window_wait", 3600),
         db_path=get_str("database", "db_path", "data/qualys_da.db"),
         daily_retention_days=get_int("retention", "daily_retention_days", 30),
         weekly_retention_weeks=get_int("retention", "weekly_retention_weeks", 52),

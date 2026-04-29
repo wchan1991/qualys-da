@@ -1,0 +1,357 @@
+{% extends "base.html" %}
+{% block title %}Data Explorer - Qualys DA{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h1>Data Explorer</h1>
+    <p class="page-subtitle">Browse raw data pulled from each Qualys API. Each table shows the most recent snapshot.</p>
+</div>
+
+<!-- Summary Cards -->
+<div class="kpi-grid" id="summary-cards" style="margin-bottom:24px;">
+    <div class="kpi-card">
+        <div class="kpi-label">CSAM Assets</div>
+        <div class="kpi-value" id="stat-csam">—</div>
+        <div class="kpi-detail" id="stat-csam-ts">—</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">VM Hosts</div>
+        <div class="kpi-value" id="stat-vmhosts">—</div>
+        <div class="kpi-detail" id="stat-vmhosts-ts">—</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">VM Detections</div>
+        <div class="kpi-value" id="stat-vmdetections">—</div>
+        <div class="kpi-detail" id="stat-vmdetections-ts">—</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">Host Tags</div>
+        <div class="kpi-value" id="stat-tags">—</div>
+        <div class="kpi-detail" id="stat-tags-ts">—</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">Detection Changes</div>
+        <div class="kpi-value" id="stat-changes">—</div>
+        <div class="kpi-detail">Append-only diff log</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">DB Size</div>
+        <div class="kpi-value" id="stat-dbsize">—</div>
+        <div class="kpi-detail" id="stat-snapshots">—</div>
+    </div>
+</div>
+
+<!-- Table Selector Tabs -->
+<div class="card">
+    <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <span>Table Browser</span>
+        <div class="pill-group" id="table-tabs">
+            <label class="pill active"><input type="radio" name="explorer-table" value="csam_assets" checked> CSAM Assets</label>
+            <label class="pill"><input type="radio" name="explorer-table" value="vm_hosts"> VM Hosts</label>
+            <label class="pill"><input type="radio" name="explorer-table" value="vm_detections"> VM Detections</label>
+            <label class="pill"><input type="radio" name="explorer-table" value="host_tags"> Host Tags</label>
+            <label class="pill"><input type="radio" name="explorer-table" value="detection_changes"> Changes</label>
+        </div>
+    </div>
+
+    <!-- Search / Filters -->
+    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center;">
+        <input type="text" id="explorer-search" class="input" placeholder="Search IP, hostname, QID..."
+               style="flex:1;min-width:200px;" onkeydown="if(event.key==='Enter')loadExplorerData();">
+        <select id="explorer-per-page" class="input" style="width:90px;" onchange="loadExplorerData();">
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="250">250</option>
+        </select>
+        <button class="btn btn-primary" onclick="loadExplorerData();">Search</button>
+        <button class="btn" onclick="exportExplorerCSV();" title="Export current view to CSV">Export CSV</button>
+    </div>
+
+    <!-- Data Table -->
+    <div class="table-wrapper" style="max-height:600px;overflow:auto;">
+        <table class="data-table" id="explorer-table">
+            <thead id="explorer-thead"><tr><th>Loading...</th></tr></thead>
+            <tbody id="explorer-tbody"><tr><td>Select a table above.</td></tr></tbody>
+        </table>
+    </div>
+
+    <!-- Pagination -->
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;">
+        <span class="metric-label" id="explorer-info">—</span>
+        <div style="display:flex;gap:6px;">
+            <button class="btn btn-small" id="explorer-prev" onclick="explorerPage(-1)" disabled>&laquo; Prev</button>
+            <button class="btn btn-small" id="explorer-next" onclick="explorerPage(1)">Next &raquo;</button>
+        </div>
+    </div>
+</div>
+
+<!-- Column Schema Reference -->
+<div class="card" id="schema-card">
+    <div class="card-header">Column Reference</div>
+    <div id="schema-content" style="font-size:13px;">
+        <p style="color:var(--text-secondary);">Select a table to see its column schema and API source.</p>
+    </div>
+</div>
+
+<!-- Snapshot History -->
+<div class="card">
+    <div class="card-header">Snapshot History</div>
+    <p style="color:var(--text-secondary);margin-bottom:12px;">
+        Each pull creates a new snapshot stamped with <code>fetched_at</code>.
+        The dashboard always reads <code>MAX(fetched_at)</code>. Older snapshots are pruned by GFS retention (30 days daily, 52 weeks weekly).
+    </p>
+    <div class="table-wrapper">
+        <table class="data-table" id="snapshot-table">
+            <thead>
+                <tr>
+                    <th>Table</th>
+                    <th>Snapshot (fetched_at)</th>
+                    <th>Rows</th>
+                </tr>
+            </thead>
+            <tbody id="snapshot-tbody">
+                <tr><td colspan="3">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── State ──────────────────────────────────────────────────
+let explorerCurrentTable = 'csam_assets';
+let explorerCurrentPage = 1;
+let explorerTotalRows = 0;
+
+// ── Schema reference per table ─────────────────────────────
+const SCHEMA = {
+    csam_assets: {
+        api: 'CSAM API — POST /rest/2.0/search/am/asset (JSON, Bearer JWT)',
+        columns: [
+            ['asset_id', 'TEXT', 'Qualys CSAM asset ID (assetId)'],
+            ['name', 'TEXT', 'Asset hostname'],
+            ['ip_address', 'TEXT', 'Primary IP (address / ipAddress)'],
+            ['os', 'TEXT', 'Operating system string'],
+            ['hardware', 'TEXT (JSON)', 'Manufacturer, model, serial'],
+            ['software', 'TEXT (JSON)', 'Installed software inventory'],
+            ['tags', 'TEXT (JSON)', 'Raw tag payload (also normalized into host_tags)'],
+            ['ports', 'TEXT (JSON)', 'Open ports'],
+            ['network_interfaces', 'TEXT (JSON)', 'NICs / MACs'],
+            ['last_seen', 'TEXT', 'Last time asset was seen'],
+            ['created', 'TEXT', 'Asset creation date'],
+            ['raw_data', 'TEXT (JSON)', 'Full API response payload'],
+            ['fetched_at', 'TEXT', 'Snapshot timestamp — shared by all rows in the same pull'],
+        ]
+    },
+    vm_hosts: {
+        api: 'VM Host List API — POST /api/3.0/fo/asset/host/ action=list (XML, Basic auth)',
+        columns: [
+            ['host_id', 'INTEGER', 'Qualys VM host ID (//HOST/ID)'],
+            ['ip_address', 'TEXT', 'Host IP (//HOST/IP)'],
+            ['dns', 'TEXT', 'DNS hostname'],
+            ['netbios', 'TEXT', 'NetBIOS name'],
+            ['os', 'TEXT', 'Operating system'],
+            ['trurisk_score', 'INTEGER', 'Host-level TruRisk (0-1000)'],
+            ['last_scan_date', 'TEXT', 'Most recent scan'],
+            ['last_vm_scanned_date', 'TEXT', 'Most recent VM scan'],
+            ['last_activity_date', 'TEXT', 'Last network activity'],
+            ['tracking_method', 'TEXT', 'IP / DNS / NETBIOS / AGENT'],
+            ['raw_data', 'TEXT (JSON)', 'Full API response payload'],
+            ['fetched_at', 'TEXT', 'Snapshot timestamp'],
+        ]
+    },
+    vm_detections: {
+        api: 'VM Detection API — POST /api/5.0/fo/asset/host/vm/detection/ action=list (XML, Basic auth)',
+        columns: [
+            ['host_id', 'INTEGER', 'Qualys VM host ID (//HOST/ID)'],
+            ['ip_address', 'TEXT', 'Host IP'],
+            ['qid', 'INTEGER', 'Qualys QID (//DETECTION/QID)'],
+            ['detection_type', 'TEXT', 'Confirmed / Potential / Information'],
+            ['severity', 'INTEGER', '1-5 severity rating'],
+            ['status', 'TEXT', 'New / Active / Fixed / Re-Opened'],
+            ['is_disabled', 'INTEGER', '0/1 — excluded from dashboards'],
+            ['qds', 'INTEGER', 'Qualys Detection Score (0-100)'],
+            ['cve_id', 'TEXT', 'Comma-joined CVE list'],
+            ['cvss_base', 'REAL', 'CVSS v3 base score'],
+            ['cvss_temporal', 'REAL', 'CVSS v3 temporal score'],
+            ['patchable', 'INTEGER', '0/1 — drives Patchable % KPI'],
+            ['title', 'TEXT', 'QID title'],
+            ['first_found', 'TEXT', 'First detection date — drives MTTR + SLA'],
+            ['last_found', 'TEXT', 'Most recent detection'],
+            ['times_found', 'INTEGER', 'Scan count'],
+            ['fetched_at', 'TEXT', 'Snapshot timestamp'],
+        ]
+    },
+    host_tags: {
+        api: 'Extracted from all three API responses (CSAM tags, VM host tags, VM detection tags)',
+        columns: [
+            ['host_id', 'INTEGER', 'VM host_id or CSAM asset_id'],
+            ['ip_address', 'TEXT', 'Host IP'],
+            ['tag_id', 'INTEGER', 'Qualys tag ID'],
+            ['tag_name', 'TEXT', 'Tag display name'],
+            ['criticality_score', 'INTEGER', 'Tag-level criticality (if set)'],
+            ['source', 'TEXT', 'csam or vm — origin of this tag assignment'],
+            ['fetched_at', 'TEXT', 'Snapshot timestamp'],
+        ]
+    },
+    detection_changes: {
+        api: 'Computed by diff engine — compares consecutive vm_detections snapshots',
+        columns: [
+            ['host_id', 'INTEGER', 'VM host ID'],
+            ['ip_address', 'TEXT', 'Host IP'],
+            ['qid', 'INTEGER', 'Qualys QID'],
+            ['change_type', 'TEXT', 'new / fixed / reopened / status_change'],
+            ['old_value', 'TEXT', 'Previous status or severity'],
+            ['new_value', 'TEXT', 'New status or severity'],
+            ['severity', 'INTEGER', 'Current severity'],
+            ['detected_at', 'TEXT', 'When the diff was observed'],
+        ]
+    },
+};
+
+// ── Column display overrides (skip heavy/uninteresting cols) ──
+const SKIP_COLS = new Set(['id', 'raw_data', 'hardware', 'software', 'ports',
+                           'network_interfaces', 'results', 'cvss_vector',
+                           'package_name', 'package_version', 'fix_version',
+                           'vendor', 'product', 'old_value', 'new_value']);
+
+// ── Init ───────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    loadSummary();
+    loadSnapshots();
+    loadExplorerData();
+
+    // Wire up table tab clicks
+    document.querySelectorAll('#table-tabs input[name="explorer-table"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            document.querySelectorAll('#table-tabs .pill').forEach(p => p.classList.remove('active'));
+            radio.closest('.pill').classList.add('active');
+            explorerCurrentTable = radio.value;
+            explorerCurrentPage = 1;
+            renderSchema(explorerCurrentTable);
+            loadExplorerData();
+        });
+    });
+    renderSchema('csam_assets');
+});
+
+// ── Summary cards ──────────────────────────────────────────
+async function loadSummary() {
+    try {
+        const r = await fetch('/api/data-explorer/summary');
+        const d = await r.json();
+        document.getElementById('stat-csam').textContent = (d.csam_assets || 0).toLocaleString();
+        document.getElementById('stat-vmhosts').textContent = (d.vm_hosts || 0).toLocaleString();
+        document.getElementById('stat-vmdetections').textContent = (d.vm_detections || 0).toLocaleString();
+        document.getElementById('stat-tags').textContent = (d.host_tags || 0).toLocaleString();
+        document.getElementById('stat-changes').textContent = (d.detection_changes || 0).toLocaleString();
+        document.getElementById('stat-dbsize').textContent = (d.db_size_mb || 0) + ' MB';
+        document.getElementById('stat-csam-ts').textContent = d.latest_csam ? 'Last pull: ' + d.latest_csam.replace('T', ' ').slice(0, 19) : 'No data';
+        document.getElementById('stat-vmhosts-ts').textContent = d.latest_vm_hosts ? 'Last pull: ' + d.latest_vm_hosts.replace('T', ' ').slice(0, 19) : 'No data';
+        document.getElementById('stat-vmdetections-ts').textContent = d.latest_vm_detections ? 'Last pull: ' + d.latest_vm_detections.replace('T', ' ').slice(0, 19) : 'No data';
+        document.getElementById('stat-tags-ts').textContent = d.latest_host_tags ? 'Last pull: ' + d.latest_host_tags.replace('T', ' ').slice(0, 19) : 'No data';
+        document.getElementById('stat-snapshots').textContent = (d.snapshot_count || 0) + ' snapshots';
+    } catch (e) {
+        console.error('Summary load failed:', e);
+    }
+}
+
+// ── Snapshot history ───────────────────────────────────────
+async function loadSnapshots() {
+    try {
+        const r = await fetch('/api/data-explorer/snapshots');
+        const d = await r.json();
+        const tbody = document.getElementById('snapshot-tbody');
+        if (!d.length) { tbody.innerHTML = '<tr><td colspan="3">No snapshots found.</td></tr>'; return; }
+        tbody.innerHTML = d.map(s =>
+            `<tr><td>${s.table_name}</td><td><code>${s.fetched_at}</code></td><td>${(s.row_count || 0).toLocaleString()}</td></tr>`
+        ).join('');
+    } catch (e) {
+        console.error('Snapshot load failed:', e);
+    }
+}
+
+// ── Table data browser ─────────────────────────────────────
+async function loadExplorerData() {
+    const search = document.getElementById('explorer-search').value.trim();
+    const perPage = document.getElementById('explorer-per-page').value;
+    const params = new URLSearchParams({
+        table: explorerCurrentTable,
+        page: explorerCurrentPage,
+        per_page: perPage,
+    });
+    if (search) params.set('search', search);
+
+    try {
+        const r = await fetch('/api/data-explorer/browse?' + params);
+        const d = await r.json();
+        explorerTotalRows = d.total || 0;
+
+        // Build header
+        const thead = document.getElementById('explorer-thead');
+        const columns = d.columns || [];
+        // Filter out heavy columns for display
+        const displayCols = columns.filter(c => !SKIP_COLS.has(c));
+        thead.innerHTML = '<tr>' + displayCols.map(c => `<th>${c}</th>`).join('') + '</tr>';
+
+        // Build body
+        const tbody = document.getElementById('explorer-tbody');
+        const rows = d.rows || [];
+        if (!rows.length) {
+            tbody.innerHTML = `<tr><td colspan="${displayCols.length}">No rows found.</td></tr>`;
+        } else {
+            tbody.innerHTML = rows.map(row => {
+                return '<tr>' + displayCols.map(c => {
+                    let val = row[c];
+                    if (val === null || val === undefined) val = '';
+                    // Truncate long strings
+                    let s = String(val);
+                    if (s.length > 80) s = s.slice(0, 77) + '...';
+                    return `<td title="${String(val).replace(/"/g, '&quot;').slice(0, 300)}">${s}</td>`;
+                }).join('') + '</tr>';
+            }).join('');
+        }
+
+        // Pagination info
+        const pageCount = Math.ceil(explorerTotalRows / parseInt(perPage));
+        document.getElementById('explorer-info').textContent =
+            `${explorerTotalRows.toLocaleString()} rows — page ${explorerCurrentPage} of ${pageCount || 1}`;
+        document.getElementById('explorer-prev').disabled = explorerCurrentPage <= 1;
+        document.getElementById('explorer-next').disabled = explorerCurrentPage >= pageCount;
+    } catch (e) {
+        console.error('Explorer load failed:', e);
+        document.getElementById('explorer-tbody').innerHTML =
+            '<tr><td>Error loading data. Check console.</td></tr>';
+    }
+}
+
+function explorerPage(delta) {
+    explorerCurrentPage = Math.max(1, explorerCurrentPage + delta);
+    loadExplorerData();
+}
+
+// ── Schema reference panel ─────────────────────────────────
+function renderSchema(table) {
+    const info = SCHEMA[table];
+    if (!info) return;
+    const el = document.getElementById('schema-content');
+    let html = `<p style="margin-bottom:8px;"><strong>API Source:</strong> <code>${info.api}</code></p>`;
+    html += '<table class="data-table" style="font-size:12px;"><thead><tr><th>Column</th><th>Type</th><th>Description</th></tr></thead><tbody>';
+    info.columns.forEach(([name, type, desc]) => {
+        html += `<tr><td><code>${name}</code></td><td>${type}</td><td>${desc}</td></tr>`;
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+}
+
+// ── CSV Export ─────────────────────────────────────────────
+function exportExplorerCSV() {
+    const search = document.getElementById('explorer-search').value.trim();
+    const params = new URLSearchParams({ table: explorerCurrentTable });
+    if (search) params.set('search', search);
+    window.location.href = '/api/data-explorer/export-csv?' + params;
+}
+</script>
+{% endblock %}

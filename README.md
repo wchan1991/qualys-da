@@ -253,6 +253,381 @@ qualys-da/
 └── tests/                 # unittest QA suite
 ```
 
+## Database schema
+
+All data lives in a single SQLite file (`data/qualys_da.db`). The schema is
+created and migrated idempotently by `QualysDADatabase._init_schema()` in
+[`src/database.py`](src/database.py). Tables fall into five groups:
+
+1. **Raw snapshots** — one row per entity per pull, stamped with `fetched_at`
+   so that every pull is a full point-in-time copy (the dashboard reads the
+   most recent `fetched_at` via `SELECT MAX(fetched_at)`). Older snapshots
+   are pruned by GFS retention.
+2. **Configuration** — user-maintained lookup tables (ownership, SLA, saved
+   queries) that are *not* stamped with `fetched_at`.
+3. **Derived history** — weekly and monthly rollups computed after each
+   refresh; these outlive raw snapshots under GFS.
+4. **Change log** — row-per-diff stream used for the "what changed this
+   week" view.
+5. **Operational state** — refresh log and CSAM pull checkpoint.
+
+### Architecture diagram — API to database data flow
+
+The diagram below shows how data flows from the three Qualys API endpoints
+through the refresh pipeline into SQLite, and how derived tables are computed
+post-refresh. Browse real data at runtime via the **Data Explorer** page
+(`/data-explorer`).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           QUALYS PLATFORM (EU1)                            │
+│                                                                            │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────┐  │
+│  │  CSAM Asset API   │  │  VM Host List    │  │  VM Detection API        │  │
+│  │  POST /rest/2.0/  │  │  POST /api/3.0/  │  │  POST /api/5.0/fo/      │  │
+│  │  search/am/asset  │  │  fo/asset/host/  │  │  asset/host/vm/         │  │
+│  │  (JSON, JWT)      │  │  (XML, Basic)    │  │  detection/ (XML,Basic) │  │
+│  └────────┬─────────┘  └────────┬─────────┘  └────────────┬─────────────┘  │
+│           │                     │                          │                │
+└───────────┼─────────────────────┼──────────────────────────┼────────────────┘
+            │                     │                          │
+            ▼                     ▼                          ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    REFRESH PIPELINE (data_manager.py)                       │
+│              ThreadPoolExecutor — 3 parallel workers                        │
+│                                                                            │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────┐  │
+│  │  CSAM Worker      │  │  VM Hosts Worker │  │  VM Detections Worker    │  │
+│  │                   │  │                  │  │                          │  │
+│  │ • Pages of 1000   │  │ • Pages of 1000  │  │ • Pages of 1000          │  │
+│  │ • Resume from     │  │ • In-memory      │  │ • In-memory buffer       │  │
+│  │   checkpoint      │  │   buffer         │  │ • on_page progress       │  │
+│  │ • Per-page save   │  │ • on_page        │  │                          │  │
+│  │   to DB           │  │   progress       │  │                          │  │
+│  │ • 3-tier throttle │  │                  │  │                          │  │
+│  │   (50/10/2)       │  │                  │  │                          │  │
+│  └────────┬─────────┘  └────────┬─────────┘  └────────────┬─────────────┘  │
+│           │                     │                          │                │
+│           │  ┌──────────────────┴──────────────────────────┘                │
+│           │  │  Per-API failure isolation: one API failing                  │
+│           │  │  does NOT cancel the others. Status: success/partial/failed  │
+│           │  │                                                             │
+└───────────┼──┼─────────────────────────────────────────────────────────────┘
+            │  │
+            ▼  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SQLite — data/qualys_da.db                            │
+│                                                                            │
+│  RAW SNAPSHOTS (fetched_at-stamped, dashboard reads MAX(fetched_at))       │
+│  ┌───────────────┐ ┌───────────────┐ ┌────────────────┐ ┌──────────────┐  │
+│  │  csam_assets   │ │  vm_hosts     │ │ vm_detections  │ │  host_tags   │  │
+│  │               │ │               │ │                │ │              │  │
+│  │ asset_id  ◄───┼─┼── ip_address ─┼─┼── ip_address ──┼─┼► ip_address  │  │
+│  │ name          │ │ host_id   ◄───┼─┼── host_id      │ │ host_id      │  │
+│  │ ip_address    │ │ dns           │ │ qid            │ │ tag_id       │  │
+│  │ os            │ │ os            │ │ severity       │ │ tag_name     │  │
+│  │ tags (JSON)   │ │ trurisk_score │ │ status         │ │ source       │  │
+│  │ hardware(JSON)│ │ last_scan_date│ │ first_found    │ │ (csam / vm)  │  │
+│  │ software(JSON)│ │ tracking      │ │ cve_id         │ │              │  │
+│  │ raw_data      │ │ raw_data      │ │ cvss_base      │ │              │  │
+│  │ fetched_at    │ │ fetched_at    │ │ fetched_at     │ │ fetched_at   │  │
+│  └───────────────┘ └───────────────┘ └────────────────┘ └──────────────┘  │
+│        ▲                   ▲                  ▲                ▲            │
+│        │      JOIN: ip_address (cross-source) │                │            │
+│        └───────────────────┴──────────────────┘                │            │
+│                            │                                   │            │
+│  DERIVED (post-refresh)    │     CONFIGURATION                 │            │
+│  ┌──────────────────┐      │     ┌──────────────────┐          │            │
+│  │ detection_changes │      │     │  asset_owners    │          │            │
+│  │ (diff stream)     │◄─────┘     │  match_type:     │──────────┘            │
+│  │ new/fixed/reopen  │            │  ip / ip_range / │                       │
+│  └──────┬───────────┘            │  tag / os_pattern│                       │
+│         │                        └──────────────────┘                       │
+│         ▼                        ┌──────────────────┐                       │
+│  ┌──────────────────┐            │  sla_targets     │                       │
+│  │ weekly_rollups   │            │  severity → days  │                       │
+│  │ (52 weeks)       │            └──────────────────┘                       │
+│  └──────┬───────────┘            ┌──────────────────┐                       │
+│         ▼                        │  saved_queries   │                       │
+│  ┌──────────────────┐            └──────────────────┘                       │
+│  │ monthly_rollups  │                                                       │
+│  │ (indefinite)     │   OPERATIONAL STATE                                   │
+│  └──────────────────┘   ┌──────────────────┐  ┌──────────────────┐          │
+│                         │  refresh_log     │  │  csam_checkpoint │          │
+│                         │  status: running │  │  resume_from_id  │          │
+│                         │  /success/partial│  │  snapshot_        │          │
+│                         │  /failed         │  │  fetched_at      │          │
+│                         └──────────────────┘  └──────────────────┘          │
+│                                                                            │
+│  VIEWS (read by SQL tab + dashboard)                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ v_detections = vm_detections ⋈ vm_hosts ⋈ asset_owners            │    │
+│  │ v_hosts      = vm_hosts ⋈ asset_owners                             │    │
+│  │ v_assets     = csam_assets ⋈ asset_owners                          │    │
+│  │ v_changes    = detection_changes ⋈ vm_hosts                        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key design points:**
+
+- **Snapshot model:** Every refresh creates a full point-in-time copy under a
+  single `fetched_at` timestamp. The dashboard always queries
+  `WHERE fetched_at = (SELECT MAX(fetched_at) FROM <table>)`. Old snapshots
+  are pruned by GFS retention (30 days daily, 52 weeks weekly, monthly
+  indefinite).
+- **Cross-source join:** CSAM and VM data are linked only through
+  `ip_address`. There are no foreign keys — all relationships are implicit.
+- **Tag normalization:** Tags appear in `csam_assets.tags` (JSON) and in the
+  VM host/detection XML. They're extracted and unified into `host_tags` with
+  a `source` column (`csam` / `vm`) so ownership rules and analytics can
+  match on tag names without parsing JSON.
+- **CSAM resilience:** CSAM pages are saved to DB individually (per-page
+  commit via `on_page` callback). A crash or rate limit mid-pull leaves
+  resumable state in `csam_checkpoint`, and the next run continues under the
+  same `snapshot_fetched_at`.
+- **Per-API failure isolation:** Each of the three parallel workers has its
+  own try/except. A failure in CSAM does not cancel VM hosts or detections.
+  The `refresh_log` row records per-API outcomes so the operator can see
+  exactly which source to re-run.
+
+### Raw snapshots
+
+#### `csam_assets` — CSAM asset inventory
+One row per asset per pull. The five JSON columns store original list/dict
+payloads verbatim so the SQL tab can `json_extract(...)` any field without a
+schema change.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | autoincrement |
+| `asset_id` | TEXT | Qualys CSAM asset ID |
+| `name` | TEXT | asset name |
+| `ip_address` | TEXT | indexed |
+| `os` | TEXT | operating system string |
+| `hardware` | TEXT | JSON — manufacturer / model / serial |
+| `software` | TEXT | JSON array — installed software inventory |
+| `tags` | TEXT | JSON array — raw tag payload (also normalized into `host_tags`) |
+| `ports` | TEXT | JSON array — open ports |
+| `network_interfaces` | TEXT | JSON array — NICs / MACs |
+| `last_seen` | TEXT | ISO timestamp |
+| `created` | TEXT | ISO timestamp |
+| `raw_data` | TEXT | full API payload (JSON) — fallback for fields not surfaced above |
+| `fetched_at` | TEXT NOT NULL | snapshot timestamp |
+| UNIQUE | `(asset_id, fetched_at)` | |
+
+#### `vm_hosts` — VM host inventory
+One row per VM host per pull.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | |
+| `host_id` | INTEGER NOT NULL | Qualys VM host ID — join key for detections and tags |
+| `ip_address` | TEXT | indexed |
+| `dns` | TEXT | DNS hostname |
+| `netbios` | TEXT | NetBIOS name |
+| `os` | TEXT | |
+| `trurisk_score` | INTEGER | host-level TruRisk (0–1000) |
+| `last_scan_date` | TEXT | most recent scan of any type |
+| `last_vm_scanned_date` | TEXT | most recent VM scan specifically |
+| `last_activity_date` | TEXT | last time the host was seen alive |
+| `tracking_method` | TEXT | `IP` / `DNS` / `NETBIOS` / `AGENT` |
+| `raw_data` | TEXT | full API payload |
+| `fetched_at` | TEXT NOT NULL | |
+| UNIQUE | `(host_id, fetched_at)` | |
+
+#### `vm_detections` — per-host vulnerability detections
+One row per (host, QID) per pull. The bulk of the database.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | |
+| `host_id` | INTEGER NOT NULL | joins to `vm_hosts.host_id` |
+| `ip_address` | TEXT | denormalized for indexing |
+| `qid` | INTEGER NOT NULL | Qualys QID |
+| `detection_type` | TEXT | `Confirmed` / `Potential` / `Information` |
+| `severity` | INTEGER | 1–5 |
+| `status` | TEXT | `New` / `Active` / `Fixed` / `Re-Opened` |
+| `is_disabled` | INTEGER | 0/1 — filtered out of dashboards by default |
+| `qds` | INTEGER | Qualys Detection Score (0–100) |
+| `cve_id` | TEXT | comma-joined list of CVEs |
+| `cvss_base` | REAL | |
+| `cvss_temporal` | REAL | |
+| `cvss_vector` | TEXT | CVSS v3 vector string |
+| `patchable` | INTEGER | 0/1 — drives Patchable % KPI |
+| `vendor` | TEXT | e.g. `Microsoft`, `Red Hat` |
+| `product` | TEXT | e.g. `Windows Server 2019` |
+| `package_name` | TEXT | affected package / component |
+| `package_version` | TEXT | version currently installed |
+| `fix_version` | TEXT | version that resolves the detection |
+| `title` | TEXT | human-readable QID title |
+| `first_found` | TEXT | drives MTTR + aging buckets |
+| `last_found` | TEXT | |
+| `last_fixed` | TEXT | |
+| `last_test` | TEXT | last time the QID was tested on this host |
+| `times_found` | INTEGER | |
+| `results` | TEXT | scan output string — indicator of what matched |
+| `raw_data` | TEXT | full API payload |
+| `fetched_at` | TEXT NOT NULL | |
+| UNIQUE | `(host_id, qid, fetched_at)` | |
+
+#### `host_tags` — normalized tag assignments
+Tags are also present as JSON inside `csam_assets.tags`, but this normalized
+table makes `JOIN … WHERE tag_name = ?` cheap.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | |
+| `host_id` | INTEGER | nullable — for pure-CSAM assets that aren't in VM |
+| `ip_address` | TEXT | |
+| `tag_id` | INTEGER NOT NULL | Qualys tag ID |
+| `tag_name` | TEXT NOT NULL | display name |
+| `criticality_score` | INTEGER | tag-level criticality (if set) |
+| `source` | TEXT NOT NULL | `csam` or `vm` — same tag may come from both |
+| `fetched_at` | TEXT NOT NULL | |
+| UNIQUE | `(host_id, tag_id, source, fetched_at)` | |
+
+### Configuration (not snapshot-scoped)
+
+#### `asset_owners` — ownership rules
+Applied via left joins in the `v_*` views to attach owner/BU to every
+detection, host, and asset.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | |
+| `match_type` | TEXT NOT NULL | `ip` / `ip_range` / `tag` / `os_pattern` |
+| `match_value` | TEXT NOT NULL | e.g. `10.0.0.0/24`, `Production`, `Windows%` |
+| `owner` | TEXT NOT NULL | |
+| `business_unit` | TEXT | |
+| `notes` | TEXT | |
+| `created_at` / `updated_at` | TEXT NOT NULL | |
+| UNIQUE | `(match_type, match_value)` | |
+
+#### `sla_targets` — days-to-fix per severity
+Seeded at first run with `{5: 7, 4: 30, 3: 90, 2: 180, 1: 365}`.
+
+| Column | Type |
+|--------|------|
+| `id` | INTEGER PK |
+| `severity` | INTEGER UNIQUE NOT NULL (1–5) |
+| `days` | INTEGER NOT NULL |
+| `updated_at` | TEXT NOT NULL |
+
+#### `saved_queries` — user-saved SQL from the SQL tab
+
+| Column | Type |
+|--------|------|
+| `id` | INTEGER PK |
+| `name` | TEXT NOT NULL |
+| `description` | TEXT |
+| `sql_text` | TEXT NOT NULL |
+| `created_at` | TEXT NOT NULL |
+| `last_run_at` | TEXT |
+
+### Derived history (survives GFS pruning)
+
+#### `weekly_rollups` — one row per ISO week (52-week retention)
+Written by `AnalyticsEngine` after every refresh. `tag_metrics` is a JSON
+blob of per-tag counts so the Tags page can show 52 weeks of history without
+another table.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | |
+| `week_start` | TEXT UNIQUE NOT NULL | ISO Monday date |
+| `total_vulns` | INTEGER | |
+| `sev5_count` … `sev1_count` | INTEGER | per-severity totals |
+| `status_new` / `_active` / `_fixed` / `_reopened` | INTEGER | |
+| `new_this_week` / `fixed_this_week` | INTEGER | drives MoM / WoW trends |
+| `avg_trurisk` / `max_trurisk` | REAL / INTEGER | |
+| `avg_qds` | REAL | |
+| `total_hosts` / `csam_hosts` / `vm_hosts` / `both_hosts` | INTEGER | coverage decomposition |
+| `coverage_pct` | REAL | `both / (csam ∪ vm)` |
+| `aging_30d` / `aging_60d` / `aging_90d` | INTEGER | vulns older than N days |
+| `tag_metrics` | TEXT | JSON `{tag: {count, sev5, ...}}` |
+| `computed_at` | TEXT NOT NULL | |
+
+#### `monthly_rollups` — one row per month (kept indefinitely)
+Same shape as `weekly_rollups` but keyed on `month_start` with
+`new_this_month` / `fixed_this_month`.
+
+### Change log
+
+#### `detection_changes` — diff stream between consecutive pulls
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | |
+| `host_id` | INTEGER NOT NULL | |
+| `ip_address` | TEXT | |
+| `qid` | INTEGER NOT NULL | |
+| `change_type` | TEXT NOT NULL | `new` / `fixed` / `reopened` / `severity_changed` / `status_changed` |
+| `old_value` / `new_value` | TEXT | before / after (severity, status, etc.) |
+| `severity` | INTEGER | |
+| `detected_at` | TEXT NOT NULL | when the diff was observed (not the Qualys timestamp) |
+
+### Operational state
+
+#### `refresh_log` — one row per refresh attempt
+Row-level `status` is the rollup; the three per-API `*_status` columns tell
+the Status Page which specific pull failed so the operator can retry just
+that source.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | |
+| `started_at` / `completed_at` | TEXT | `completed_at` NULL while running |
+| `source` | TEXT NOT NULL | `all` / `csam` / `vm-hosts` / `vm-detections` |
+| `csam_count` / `vm_host_count` / `vm_detection_count` | INTEGER | actual rows written |
+| `csam_expected` / `vm_host_expected` / `vm_detection_expected` | INTEGER | total reported by the API — lets the UI render a progress bar mid-pull |
+| `changes_detected` | INTEGER | rows written to `detection_changes` |
+| `status` | TEXT NOT NULL | `running` / `success` / `partial` / `error` |
+| `error` | TEXT | |
+| `csam_status` / `vm_host_status` / `vm_detection_status` | TEXT | per-API outcome |
+
+#### `csam_checkpoint` — single-row resume state for CSAM pulls
+CSAM pulls are paginated and can span many minutes. If one fails halfway,
+the next run resumes from `last_asset_id` under the *same* `snapshot_fetched_at`
+so the two halves land in one coherent snapshot instead of being split
+across two `fetched_at` values (which would halve the host count on the
+dashboard).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK CHECK(id = 1) | enforces single row |
+| `last_asset_id` | TEXT | next `startFromId` |
+| `assets_pulled` | INTEGER DEFAULT 0 | |
+| `started_at` / `updated_at` | TEXT | |
+| `completed` | INTEGER DEFAULT 0 | flipped to 1 on clean finish |
+| `lookback_days` | INTEGER | pull-time parameter |
+| `note` | TEXT | human-readable context for the UI |
+| `snapshot_fetched_at` | TEXT | the `fetched_at` value shared by every page of the in-flight pull |
+
+### Views (read by the SQL tab)
+
+All four views scope their join-key raw tables to the most-recent
+`fetched_at`, and left-join `asset_owners` so `owner` / `business_unit`
+appear on every row. The SQL tab's allow-list is exactly these views:
+
+| View | Built from | Purpose |
+|------|------------|---------|
+| `v_detections` | `vm_detections` ⋈ `vm_hosts` ⋈ `asset_owners` | latest detections with host + owner columns attached |
+| `v_hosts` | `vm_hosts` ⋈ `asset_owners` | latest VM hosts with owner |
+| `v_assets` | `csam_assets` ⋈ `asset_owners` | latest CSAM assets with owner |
+| `v_changes` | `detection_changes` ⋈ `vm_hosts` | change log with host DNS/OS attached |
+
+### Indexes
+
+All high-traffic columns are indexed. Notable composites:
+
+- `idx_vmhosts_fetched_ip (fetched_at, ip_address)` — drives the Hosts page lookup.
+- `idx_detect_fetched_sev (fetched_at, severity, status)` — drives the Dashboard severity+status panels.
+- `idx_detect_fetched_ip (fetched_at, ip_address)` — drives per-host detection drilldowns.
+- `idx_detect_cve (cve_id, fetched_at)` / `idx_detect_cvss (cvss_base, fetched_at)` / `idx_detect_patchable (patchable, fetched_at)` — KPI cards.
+- `idx_tags_name (tag_name, fetched_at)` — Tags page.
+
 ## Dashboard formulas
 
 Every number shown on the dashboard, 6-Pack, KPIs, Tags, Trends, and Ownership

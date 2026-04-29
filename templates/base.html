@@ -43,6 +43,7 @@
                     <a href="{{ url_for('custom_query_page') }}">SQL</a>
                 </div>
             </div>
+            <a href="{{ url_for('data_explorer_page') }}" class="nav-link {% if request.endpoint == 'data_explorer_page' %}active{% endif %}">Data Explorer</a>
             <a href="{{ url_for('settings_page') }}" class="nav-link {% if request.endpoint == 'settings_page' %}active{% endif %}">Settings</a>
         </div>
         <div class="nav-actions">

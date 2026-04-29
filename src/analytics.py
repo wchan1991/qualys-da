@@ -574,23 +574,23 @@ class AnalyticsEngine:
                     group_ips.setdefault(os_name, []).append(r["ip_address"])
         elif group_by == "business_unit":
             if host_fetched:
-                for r in self.db.conn.execute(
+                all_ips = [r["ip_address"] for r in self.db.conn.execute(
                     "SELECT DISTINCT ip_address FROM vm_hosts WHERE fetched_at = ?",
                     (host_fetched,),
-                ).fetchall():
-                    ip = r["ip_address"]
-                    resolved = self.db.get_asset_owner(ip)
-                    bu = (resolved or {}).get("business_unit") or "Unassigned"
+                ).fetchall()]
+                resolved = self._batch_resolve_owners(all_ips)
+                for ip in all_ips:
+                    bu = (resolved.get(ip) or {}).get("business_unit") or "Unassigned"
                     group_ips.setdefault(bu, []).append(ip)
         else:  # owner
             if host_fetched:
-                for r in self.db.conn.execute(
+                all_ips = [r["ip_address"] for r in self.db.conn.execute(
                     "SELECT DISTINCT ip_address FROM vm_hosts WHERE fetched_at = ?",
                     (host_fetched,),
-                ).fetchall():
-                    ip = r["ip_address"]
-                    resolved = self.db.get_asset_owner(ip)
-                    name = (resolved or {}).get("owner") or "Unassigned"
+                ).fetchall()]
+                resolved = self._batch_resolve_owners(all_ips)
+                for ip in all_ips:
+                    name = (resolved.get(ip) or {}).get("owner") or "Unassigned"
                     group_ips.setdefault(name, []).append(ip)
 
         # Enterprise totals come from a single query (not sum-of-groups) so that
@@ -624,9 +624,12 @@ class AnalyticsEngine:
         for name, ips in group_ips.items():
             if not ips:
                 continue
-            ph = ",".join("?" * len(ips))
-            row = self.db.conn.execute(
-                f"""SELECT
+
+            # Summary stats — chunked to stay under SQLite variable limit.
+            # SUM columns are additive across chunks. COUNT(DISTINCT) may
+            # over-count slightly at chunk boundaries; negligible at chunk_size=900.
+            agg = self._chunked_agg_query(
+                """SELECT
                        SUM(CASE WHEN cvss_base >= 9.0 THEN 1 ELSE 0 END) AS critical,
                        SUM(CASE WHEN cvss_base >= 7.0 AND cvss_base < 9.0 THEN 1 ELSE 0 END) AS high,
                        SUM(CASE WHEN cvss_base >= 4.0 AND cvss_base < 7.0 THEN 1 ELSE 0 END) AS medium,
@@ -638,13 +641,15 @@ class AnalyticsEngine:
                     WHERE fetched_at = ? AND is_disabled = 0
                       AND status IN ('New','Active','Re-Opened')
                       AND ip_address IN ({ph})""",
-                [det_fetched] + ips,
-            ).fetchone()
+                [det_fetched],
+                ips,
+                ["critical", "high", "medium", "low", "total_cves", "unique_hosts", "max_cvss"],
+            )
 
-            # Top *critical* CVE for the group — most prevalent CVE with
-            # CVSS >= 9.0 (falls back to top overall if no critical present).
-            top_cve_row = self.db.conn.execute(
-                f"""SELECT cve_id,
+            # Top *critical* CVE — collect per-cve rows from all chunks,
+            # re-aggregate in Python, pick the one with the most affected hosts.
+            crit_rows = self._chunked_in_query(
+                """SELECT cve_id,
                            MAX(title) AS title,
                            COUNT(DISTINCT ip_address) AS affected_hosts,
                            MAX(cvss_base) AS cvss
@@ -654,15 +659,15 @@ class AnalyticsEngine:
                       AND cve_id IS NOT NULL
                       AND cvss_base >= 9.0
                       AND ip_address IN ({ph})
-                    GROUP BY cve_id
-                    ORDER BY affected_hosts DESC
-                    LIMIT 1""",
-                [det_fetched] + ips,
-            ).fetchone()
-            if not top_cve_row or not top_cve_row["cve_id"]:
+                    GROUP BY cve_id""",
+                [det_fetched],
+                ips,
+            )
+            top_cve_row = self._pick_top_cve(crit_rows)
+            if not top_cve_row:
                 # Fallback: most prevalent CVE at any severity
-                top_cve_row = self.db.conn.execute(
-                    f"""SELECT cve_id,
+                all_rows = self._chunked_in_query(
+                    """SELECT cve_id,
                                MAX(title) AS title,
                                COUNT(DISTINCT ip_address) AS affected_hosts,
                                MAX(cvss_base) AS cvss
@@ -671,34 +676,36 @@ class AnalyticsEngine:
                           AND status IN ('New','Active','Re-Opened')
                           AND cve_id IS NOT NULL
                           AND ip_address IN ({ph})
-                        GROUP BY cve_id
-                        ORDER BY affected_hosts DESC
-                        LIMIT 1""",
-                    [det_fetched] + ips,
-                ).fetchone()
+                        GROUP BY cve_id""",
+                    [det_fetched],
+                    ips,
+                )
+                top_cve_row = self._pick_top_cve(all_rows)
 
             # Per-group avg TruRisk score (from vm_hosts)
             avg_trurisk = None
             if host_fetched:
-                tr_row = self.db.conn.execute(
-                    f"""SELECT AVG(trurisk_score) AS avg_tr
+                tr_agg = self._chunked_agg_query(
+                    """SELECT SUM(trurisk_score) AS total_tr, COUNT(*) AS tr_cnt
                         FROM vm_hosts
                         WHERE fetched_at = ? AND trurisk_score > 0
                           AND ip_address IN ({ph})""",
-                    [host_fetched] + ips,
-                ).fetchone()
-                if tr_row and tr_row["avg_tr"] is not None:
-                    avg_trurisk = round(tr_row["avg_tr"], 0)
+                    [host_fetched],
+                    ips,
+                    ["total_tr", "tr_cnt"],
+                )
+                if tr_agg["tr_cnt"]:
+                    avg_trurisk = round(tr_agg["total_tr"] / tr_agg["tr_cnt"], 0)
 
             g = {
                 "name": name,
-                "critical": row["critical"] or 0,
-                "high": row["high"] or 0,
-                "medium": row["medium"] or 0,
-                "low": row["low"] or 0,
-                "total_cves": row["total_cves"] or 0,
-                "unique_hosts": row["unique_hosts"] or 0,
-                "max_cvss": round(row["max_cvss"] or 0, 1),
+                "critical": agg["critical"] or 0,
+                "high": agg["high"] or 0,
+                "medium": agg["medium"] or 0,
+                "low": agg["low"] or 0,
+                "total_cves": agg["total_cves"] or 0,
+                "unique_hosts": agg["unique_hosts"] or 0,
+                "max_cvss": round(agg["max_cvss"] or 0, 1),
                 "avg_trurisk": avg_trurisk,
                 "top_cve": top_cve_row["cve_id"] if top_cve_row else None,
                 "top_cve_title": top_cve_row["title"] if top_cve_row else None,
@@ -731,23 +738,23 @@ class AnalyticsEngine:
                     group_ips.setdefault(r["os"] or "Unknown", []).append(r["ip_address"])
         elif group_by == "business_unit":
             if host_fetched:
-                for r in self.db.conn.execute(
+                all_ips = [r["ip_address"] for r in self.db.conn.execute(
                     "SELECT DISTINCT ip_address FROM vm_hosts WHERE fetched_at = ?",
                     (host_fetched,),
-                ).fetchall():
-                    ip = r["ip_address"]
-                    resolved = self.db.get_asset_owner(ip)
-                    bu = (resolved or {}).get("business_unit") or "Unassigned"
+                ).fetchall()]
+                resolved = self._batch_resolve_owners(all_ips)
+                for ip in all_ips:
+                    bu = (resolved.get(ip) or {}).get("business_unit") or "Unassigned"
                     group_ips.setdefault(bu, []).append(ip)
         else:  # owner
             if host_fetched:
-                for r in self.db.conn.execute(
+                all_ips = [r["ip_address"] for r in self.db.conn.execute(
                     "SELECT DISTINCT ip_address FROM vm_hosts WHERE fetched_at = ?",
                     (host_fetched,),
-                ).fetchall():
-                    ip = r["ip_address"]
-                    resolved = self.db.get_asset_owner(ip)
-                    name = (resolved or {}).get("owner") or "Unassigned"
+                ).fetchall()]
+                resolved = self._batch_resolve_owners(all_ips)
+                for ip in all_ips:
+                    name = (resolved.get(ip) or {}).get("owner") or "Unassigned"
                     group_ips.setdefault(name, []).append(ip)
         return group_ips
 
@@ -808,30 +815,39 @@ class AnalyticsEngine:
 
         # Per-month change counts (only for OPEN ↔ FIXED transitions —
         # severity_change events don't move the active anchor)
-        params: List = [earliest]
-        ip_clause = ""
         if scoped_ips is not None:
-            ph = ",".join("?" * len(scoped_ips))
-            ip_clause = f" AND ip_address IN ({ph})"
-            params += scoped_ips
+            rows = self._chunked_in_query(
+                """SELECT substr(detected_at, 1, 7) AS ym,
+                          change_type,
+                          COUNT(*) AS cnt
+                   FROM detection_changes
+                   WHERE detected_at >= ?
+                     AND change_type IN ('new','fixed','reopened')
+                     AND ip_address IN ({ph})
+                   GROUP BY ym, change_type""",
+                [earliest],
+                scoped_ips,
+            )
+        else:
+            rows = self.db.conn.execute(
+                """SELECT substr(detected_at, 1, 7) AS ym,
+                          change_type,
+                          COUNT(*) AS cnt
+                   FROM detection_changes
+                   WHERE detected_at >= ?
+                     AND change_type IN ('new','fixed','reopened')
+                   GROUP BY ym, change_type""",
+                [earliest],
+            ).fetchall()
 
-        rows = self.db.conn.execute(
-            f"""SELECT substr(detected_at, 1, 7) AS ym,
-                      change_type,
-                      COUNT(*) AS cnt
-               FROM detection_changes
-               WHERE detected_at >= ?
-                 AND change_type IN ('new','fixed','reopened'){ip_clause}
-               GROUP BY ym, change_type""",
-            params,
-        ).fetchall()
-
-        by_month = {ym: {"new": 0, "fixed": 0, "reopened": 0} for ym in months}
+        # Merge chunked GROUP BY rows: same (ym, change_type) may appear in
+        # multiple chunks, so accumulate counts.
+        by_month: Dict[str, Dict[str, int]] = {ym: {"new": 0, "fixed": 0, "reopened": 0} for ym in months}
         for r in rows:
             ym = r["ym"]
             ct = r["change_type"]
             if ym in by_month and ct in ("new", "fixed", "reopened"):
-                by_month[ym][ct] = r["cnt"]
+                by_month[ym][ct] += r["cnt"]
 
         new_arr      = [by_month[ym]["new"]      for ym in months]
         fixed_arr    = [by_month[ym]["fixed"]    for ym in months]
@@ -843,19 +859,24 @@ class AnalyticsEngine:
         det_fetched = self._fetched_at("vm_detections")
         end_active = 0
         if det_fetched:
-            active_params: List = [det_fetched]
-            active_ip_clause = ""
             if scoped_ips is not None:
-                ph = ",".join("?" * len(scoped_ips))
-                active_ip_clause = f" AND ip_address IN ({ph})"
-                active_params += scoped_ips
-            end_active = self.db.conn.execute(
-                f"""SELECT COUNT(*) FROM vm_detections
-                    WHERE fetched_at = ? AND is_disabled = 0
-                      AND status IN ('New','Active','Re-Opened')
-                      {active_ip_clause}""",
-                active_params,
-            ).fetchone()[0] or 0
+                active_agg = self._chunked_agg_query(
+                    """SELECT COUNT(*) AS cnt FROM vm_detections
+                        WHERE fetched_at = ? AND is_disabled = 0
+                          AND status IN ('New','Active','Re-Opened')
+                          AND ip_address IN ({ph})""",
+                    [det_fetched],
+                    scoped_ips,
+                    ["cnt"],
+                )
+                end_active = active_agg["cnt"] or 0
+            else:
+                end_active = self.db.conn.execute(
+                    """SELECT COUNT(*) FROM vm_detections
+                        WHERE fetched_at = ? AND is_disabled = 0
+                          AND status IN ('New','Active','Re-Opened')""",
+                    [det_fetched],
+                ).fetchone()[0] or 0
 
         # Back-derive start_active: end - sum(net) is the anchor at the start.
         total_net = sum(net_arr)
@@ -1099,10 +1120,12 @@ class AnalyticsEngine:
             ).fetchall():
                 det_counts[r["ip_address"]] = r["cnt"]
 
-        # Filter to hosts with NO matched owner
+        # Filter to hosts with NO matched owner — batch-resolve in one pass
+        all_source_ips = list(ips_by_source.keys())
+        resolved_map = self._batch_resolve_owners(all_source_ips)
         orphans = []
         for ip, info in ips_by_source.items():
-            resolved = self.db.get_asset_owner(ip)
+            resolved = resolved_map.get(ip)
             if resolved and resolved.get("owner"):
                 continue  # has an owner — skip
             info["open_vulns"] = det_counts.get(ip, 0)
@@ -1370,24 +1393,27 @@ class AnalyticsEngine:
             if not info["ips"]:
                 continue
             ips = list(info["ips"])
-            placeholders = ",".join("?" * len(ips))
-            row = self.db.conn.execute(
-                f"""SELECT
+            agg = self._chunked_agg_query(
+                """SELECT
                       COUNT(*) as total_vulns,
                       SUM(CASE WHEN severity >= 4 THEN 1 ELSE 0 END) as critical,
-                      AVG(severity) as avg_severity
+                      SUM(severity) as total_severity
                     FROM vm_detections
-                    WHERE fetched_at = ? AND ip_address IN ({placeholders})
+                    WHERE fetched_at = ? AND ip_address IN ({ph})
                     AND status IN ('New','Active') AND is_disabled = 0""",
-                [det_fetched] + ips,
-            ).fetchone()
+                [det_fetched],
+                ips,
+                ["total_vulns", "critical", "total_severity"],
+            )
+            total_vulns = agg["total_vulns"] or 0
+            avg_severity = round((agg["total_severity"] or 0) / max(total_vulns, 1), 1)
             results.append({
                 "owner": owner_name,
                 "business_unit": info["business_unit"],
                 "host_count": len(ips),
-                "total_vulns": row["total_vulns"] or 0,
-                "critical": row["critical"] or 0,
-                "avg_severity": round(row["avg_severity"] or 0, 1),
+                "total_vulns": total_vulns,
+                "critical": agg["critical"] or 0,
+                "avg_severity": avg_severity,
             })
         results.sort(key=lambda x: x["total_vulns"], reverse=True)
         return results
@@ -1484,10 +1510,11 @@ class AnalyticsEngine:
         for name, ips in group_ips.items():
             if not ips:
                 continue
-            ph = ",".join("?" * len(ips))
-            rows = self.db.conn.execute(
-                f"""SELECT substr(first_found, 1, 7) AS ym,
-                           AVG(julianday('now') - julianday(first_found)) AS avg_age,
+            # Use _chunked_in_query + SUM(age) so we can merge avg_age
+            # correctly across chunks (weighted by count).
+            rows = self._chunked_in_query(
+                """SELECT substr(first_found, 1, 7) AS ym,
+                           SUM(julianday('now') - julianday(first_found)) AS total_age,
                            COUNT(*) AS cnt,
                            SUM(CASE
                                WHEN severity = 5
@@ -1506,15 +1533,24 @@ class AnalyticsEngine:
                       AND status IN ('New','Active') AND is_disabled = 0
                       AND first_found != ''
                     GROUP BY ym""",
-                [sla5, sla4, sla3, sla2, sla1, det_fetched] + ips,
-            ).fetchall()
+                [sla5, sla4, sla3, sla2, sla1, det_fetched],
+                ips,
+            )
 
-            # Key by month; fill missing months with zero so the chart x-axis
-            # aligns across groups.
-            by_month = {r["ym"]: r for r in rows}
+            # Merge chunked GROUP BY rows: same ym may appear in multiple
+            # chunks, so accumulate totals and recompute avg_age.
+            by_month: Dict[str, Dict[str, float]] = {}
+            for r in rows:
+                ym = r["ym"]
+                if ym not in by_month:
+                    by_month[ym] = {"total_age": 0.0, "cnt": 0, "breach_count": 0}
+                by_month[ym]["total_age"] += r["total_age"] or 0
+                by_month[ym]["cnt"] += r["cnt"] or 0
+                by_month[ym]["breach_count"] += r["breach_count"] or 0
+
             avg_age_series = [
-                round(by_month[m]["avg_age"], 1)
-                if m in by_month and by_month[m]["avg_age"] is not None else 0
+                round(by_month[m]["total_age"] / max(by_month[m]["cnt"], 1), 1)
+                if m in by_month and by_month[m]["cnt"] else 0
                 for m in months
             ]
             sla_series = [
@@ -1647,6 +1683,78 @@ class AnalyticsEngine:
                         continue
         return resolved
 
+    def _chunked_in_query(self, sql_template: str, fixed_params: List,
+                          ip_list: List[str], *, chunk_size: int = 900) -> List:
+        """Execute a query with an IN(...) clause, chunking the IP list to
+        stay under SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (default 999).
+
+        `sql_template` must contain a single `{ph}` placeholder where the
+        `IN (?,?,...)` values go. `fixed_params` are the leading bind params
+        (e.g. `[fetched_at]`). Results from all chunks are concatenated.
+        """
+        if not ip_list:
+            return []
+        all_rows: List = []
+        for i in range(0, len(ip_list), chunk_size):
+            chunk = ip_list[i : i + chunk_size]
+            ph = ",".join("?" * len(chunk))
+            sql = sql_template.replace("{ph}", ph)
+            all_rows.extend(
+                self.db.conn.execute(sql, fixed_params + chunk).fetchall()
+            )
+        return all_rows
+
+    def _chunked_agg_query(self, sql_template: str, fixed_params: List,
+                           ip_list: List[str], agg_columns: List[str],
+                           *, chunk_size: int = 900) -> Dict[str, Any]:
+        """Like _chunked_in_query but for aggregate queries (SUM/COUNT).
+
+        Runs the query in chunks and sums numeric columns across chunks.
+        `agg_columns` lists the column names to sum. Returns a dict.
+        """
+        totals: Dict[str, Any] = {col: 0 for col in agg_columns}
+        if not ip_list:
+            return totals
+        for i in range(0, len(ip_list), chunk_size):
+            chunk = ip_list[i : i + chunk_size]
+            ph = ",".join("?" * len(chunk))
+            sql = sql_template.replace("{ph}", ph)
+            row = self.db.conn.execute(sql, fixed_params + chunk).fetchone()
+            if row:
+                for col in agg_columns:
+                    totals[col] = (totals[col] or 0) + (row[col] or 0)
+        return totals
+
+    @staticmethod
+    def _pick_top_cve(rows: List) -> Optional[Dict]:
+        """Merge per-CVE rows from chunked queries and return the top CVE.
+
+        Each chunk may have produced its own GROUP BY result for the same
+        cve_id. We merge by summing affected_hosts per cve_id, keeping the
+        max cvss and last title, then pick the cve_id with the most hosts.
+        """
+        if not rows:
+            return None
+        merged: Dict[str, Dict] = {}
+        for r in rows:
+            cid = r["cve_id"]
+            if not cid:
+                continue
+            if cid not in merged:
+                merged[cid] = {
+                    "cve_id": cid,
+                    "title": r["title"],
+                    "affected_hosts": r["affected_hosts"] or 0,
+                    "cvss": r["cvss"] or 0,
+                }
+            else:
+                merged[cid]["affected_hosts"] += r["affected_hosts"] or 0
+                merged[cid]["cvss"] = max(merged[cid]["cvss"], r["cvss"] or 0)
+                merged[cid]["title"] = merged[cid]["title"] or r["title"]
+        if not merged:
+            return None
+        return max(merged.values(), key=lambda x: x["affected_hosts"])
+
     def _group_ips_by_owner(self, ips: List[str]) -> Dict[str, Dict[str, Any]]:
         """Batch-group a list of IPs by resolved owner (Unassigned for misses).
 
@@ -1728,17 +1836,14 @@ class AnalyticsEngine:
         return sorted(groups, key=lambda x: x["total_vulns"], reverse=True)
 
     def _six_pack_metrics_for_ips(self, fetched: str, ips: List[str], sla: Dict) -> Dict:
-        placeholders = ",".join("?" * len(ips))
-
         # Precompute per-severity SLA cutoff timestamps so the breach check
         # can be folded into the same aggregation query as total + weighted age.
-        # Was: 6 queries (1 age + 5 severity). Now: 1 query.
         cutoffs = {
             sev: (datetime.utcnow() - timedelta(days=sla.get(sev, 365))).isoformat()
             for sev in range(1, 6)
         }
-        row = self.db.conn.execute(
-            f"""SELECT
+        agg = self._chunked_agg_query(
+            """SELECT
                   SUM(julianday('now') - julianday(first_found)) AS total_age,
                   COUNT(*) AS cnt,
                   SUM(CASE
@@ -1749,28 +1854,32 @@ class AnalyticsEngine:
                       WHEN severity = 1 AND first_found <= ? THEN 1
                       ELSE 0 END) AS breach_count
                 FROM vm_detections
-                WHERE fetched_at = ? AND ip_address IN ({placeholders})
+                WHERE fetched_at = ? AND ip_address IN ({ph})
                   AND status IN ('New','Active') AND is_disabled = 0
                   AND first_found != ''""",
-            [cutoffs[5], cutoffs[4], cutoffs[3], cutoffs[2], cutoffs[1], fetched] + ips,
-        ).fetchone()
-        total_vulns = row["cnt"] or 0
-        weighted_age = round((row["total_age"] or 0) / max(total_vulns, 1), 1)
-        breach_count = row["breach_count"] or 0
+            [cutoffs[5], cutoffs[4], cutoffs[3], cutoffs[2], cutoffs[1], fetched],
+            ips,
+            ["total_age", "cnt", "breach_count"],
+        )
+        total_vulns = agg["cnt"] or 0
+        weighted_age = round((agg["total_age"] or 0) / max(total_vulns, 1), 1)
+        breach_count = agg["breach_count"] or 0
 
         # Average TruRisk score for hosts in the group
         host_fetched = self._fetched_at("vm_hosts")
         avg_trurisk = None
-        if host_fetched:
-            tr_row = self.db.conn.execute(
-                f"""SELECT AVG(trurisk_score) AS avg_tr
+        if host_fetched and ips:
+            tr_agg = self._chunked_agg_query(
+                """SELECT SUM(trurisk_score) AS total_tr, COUNT(*) AS tr_cnt
                     FROM vm_hosts
                     WHERE fetched_at = ? AND trurisk_score > 0
-                      AND ip_address IN ({placeholders})""",
-                [host_fetched] + ips,
-            ).fetchone()
-            if tr_row and tr_row["avg_tr"] is not None:
-                avg_trurisk = round(tr_row["avg_tr"], 0)
+                      AND ip_address IN ({ph})""",
+                [host_fetched],
+                ips,
+                ["total_tr", "tr_cnt"],
+            )
+            if tr_agg["tr_cnt"]:
+                avg_trurisk = round(tr_agg["total_tr"] / tr_agg["tr_cnt"], 0)
 
         return {
             "total_vulns": total_vulns,

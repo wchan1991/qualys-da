@@ -44,6 +44,17 @@ csam_lookback_days = 90
 # last asset ID and resume from there next time. Set to false to always start
 # from the beginning.
 csam_resume_enabled = true
+# When Qualys returns 429 (rate limit hit), sleep the server's reported
+# X-RateLimit-ToWait-Sec and retry — up to N times in a row. This lets a
+# single refresh wait through multiple rate-limit windows so big tenants
+# (>40k CSAM assets per window) finish a full pull in one unattended run
+# instead of needing manual re-triggers. Set to 1 for the old single-retry
+# behaviour. 3 is enough for ~120k-asset fleets.
+csam_max_window_hops = 3
+# Per-hop wait ceiling (seconds). Clamps an extreme/malformed
+# X-RateLimit-ToWait-Sec value so a stuck call can't hang the refresh
+# for hours. 3600 = 1h. Real-world Qualys window resets are ~50 min.
+csam_max_window_wait = 3600
 
 [rate_limit]
 calls_per_minute = 60

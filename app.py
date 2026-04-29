@@ -607,13 +607,15 @@ def api_import_owners():
 @app.route("/api/owners/unassigned")
 @api_response
 def api_unassigned():
-    db = get_manager().db
-    # Get all hosts, then filter out ones with an owner
-    hosts = db.get_latest_vm_hosts(page=1, per_page=5000)
+    mgr = get_manager()
+    # Batch-resolve owners in one pass instead of per-IP queries
+    hosts = mgr.db.get_latest_vm_hosts(page=1, per_page=5000)
+    all_ips = [h.get("ip_address", "") for h in hosts]
+    resolved_map = mgr.analytics._batch_resolve_owners(all_ips)
     unassigned = []
     for h in hosts:
-        owner = db.get_asset_owner(h.get("ip_address", ""))
-        if not owner:
+        ip = h.get("ip_address", "")
+        if not resolved_map.get(ip):
             unassigned.append(h)
     return unassigned[:500]
 
@@ -881,6 +883,174 @@ def api_refresh_status():
     # say "showing last snapshot from <time>" while the new pull runs.
     row["last_success_fetched_at"] = db.get_latest_fetched_at("csam_assets")
     return row
+
+
+# ============================================================
+# DATA EXPLORER
+# ============================================================
+
+@app.route("/data-explorer")
+def data_explorer_page():
+    return render_template("data_explorer.html")
+
+
+@app.route("/api/data-explorer/summary")
+@api_response
+def api_data_explorer_summary():
+    """Summary stats for the data explorer cards."""
+    db = get_manager().db
+    stats = db.get_db_stats()
+    # Add latest fetched_at for host_tags
+    stats["latest_host_tags"] = db.get_latest_fetched_at("host_tags")
+    # Count distinct snapshots across all snapshot tables
+    snapshot_count = 0
+    for table in ("csam_assets", "vm_hosts", "vm_detections", "host_tags"):
+        row = db.conn.execute(
+            f"SELECT COUNT(DISTINCT fetched_at) FROM {table}"
+        ).fetchone()
+        snapshot_count += row[0] if row else 0
+    stats["snapshot_count"] = snapshot_count
+    return stats
+
+
+@app.route("/api/data-explorer/snapshots")
+@api_response
+def api_data_explorer_snapshots():
+    """List all snapshot timestamps across the four raw tables, with row counts."""
+    db = get_manager().db
+    snapshots = []
+    for table in ("csam_assets", "vm_hosts", "vm_detections", "host_tags"):
+        rows = db.conn.execute(
+            f"""SELECT '{table}' AS table_name, fetched_at, COUNT(*) AS row_count
+                FROM {table} GROUP BY fetched_at ORDER BY fetched_at DESC"""
+        ).fetchall()
+        snapshots.extend([dict(r) for r in rows])
+    # Sort by fetched_at descending
+    snapshots.sort(key=lambda s: s.get("fetched_at", ""), reverse=True)
+    return snapshots
+
+
+EXPLORER_TABLES = {
+    "csam_assets", "vm_hosts", "vm_detections", "host_tags", "detection_changes",
+}
+
+EXPLORER_SEARCH_COLS = {
+    "csam_assets": ["ip_address", "name", "asset_id", "os"],
+    "vm_hosts": ["ip_address", "dns", "os", "netbios"],
+    "vm_detections": ["ip_address", "qid", "cve_id", "title", "status"],
+    "host_tags": ["ip_address", "tag_name", "source"],
+    "detection_changes": ["ip_address", "qid", "change_type"],
+}
+
+
+@app.route("/api/data-explorer/browse")
+@api_response
+def api_data_explorer_browse():
+    """Paginated browse of a raw table (latest snapshot for snapshot tables)."""
+    table = request.args.get("table", "csam_assets")
+    if table not in EXPLORER_TABLES:
+        return {"error": f"Unknown table: {table}"}, 400
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = min(500, max(1, request.args.get("per_page", 50, type=int)))
+    search = request.args.get("search", "").strip()
+    db = get_manager().db
+
+    # Snapshot-scoped tables filter to latest fetched_at
+    where_parts = []
+    params = []
+    if table in ("csam_assets", "vm_hosts", "vm_detections", "host_tags"):
+        fetched = db.get_latest_fetched_at(table)
+        if fetched:
+            where_parts.append("fetched_at = ?")
+            params.append(fetched)
+
+    # Search filter
+    if search:
+        search_cols = EXPLORER_SEARCH_COLS.get(table, [])
+        if search_cols:
+            or_clauses = []
+            for col in search_cols:
+                or_clauses.append(f"{col} LIKE ?")
+                params.append(f"%{search}%")
+            where_parts.append(f"({' OR '.join(or_clauses)})")
+
+    where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    # Count
+    count_row = db.conn.execute(
+        f"SELECT COUNT(*) FROM {table}{where_sql}", params
+    ).fetchone()
+    total = count_row[0] if count_row else 0
+
+    # Column names
+    col_info = db.conn.execute(f"PRAGMA table_info({table})").fetchall()
+    columns = [c["name"] for c in col_info]
+
+    # Data (skip heavy columns from the query to keep it fast)
+    skip = {"raw_data", "hardware", "software", "ports", "network_interfaces", "results"}
+    select_cols = [c for c in columns if c not in skip]
+
+    offset = (page - 1) * per_page
+    rows = db.conn.execute(
+        f"SELECT {','.join(select_cols)} FROM {table}{where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [per_page, offset],
+    ).fetchall()
+
+    return {
+        "table": table,
+        "columns": select_cols,
+        "rows": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    }
+
+
+@app.route("/api/data-explorer/export-csv")
+def api_data_explorer_export_csv():
+    """Export the full latest snapshot of a table as CSV."""
+    table = request.args.get("table", "csam_assets")
+    if table not in EXPLORER_TABLES:
+        return jsonify({"error": f"Unknown table: {table}"}), 400
+    search = request.args.get("search", "").strip()
+    db = get_manager().db
+
+    where_parts = []
+    params = []
+    if table in ("csam_assets", "vm_hosts", "vm_detections", "host_tags"):
+        fetched = db.get_latest_fetched_at(table)
+        if fetched:
+            where_parts.append("fetched_at = ?")
+            params.append(fetched)
+    if search:
+        search_cols = EXPLORER_SEARCH_COLS.get(table, [])
+        if search_cols:
+            or_clauses = [f"{col} LIKE ?" for col in search_cols]
+            params.extend(f"%{search}%" for _ in search_cols)
+            where_parts.append(f"({' OR '.join(or_clauses)})")
+
+    where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    # Exclude raw_data to keep export manageable
+    col_info = db.conn.execute(f"PRAGMA table_info({table})").fetchall()
+    columns = [c["name"] for c in col_info if c["name"] != "raw_data"]
+
+    rows = db.conn.execute(
+        f"SELECT {','.join(columns)} FROM {table}{where_sql} ORDER BY id DESC",
+        params,
+    ).fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(columns)
+    for row in rows:
+        writer.writerow([row[c] for c in columns])
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={table}_export.csv"},
+    )
 
 
 # ============================================================

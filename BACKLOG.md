@@ -39,6 +39,26 @@ log once landed.
 
 ---
 
+## 2026-04-29 — In-process CSAM window hopping
+**Area:** `src/api_client.py::_csam_request`, `src/config_loader.py`, `config/.config.example`
+**Why:** A ~100k-asset fleet exceeds the per-window cap (~40k) so a full pull always tripped a 429, retried once, hit a second 429, and gave up — leaving the operator to manually re-trigger after the window reset. Now `_csam_request` loops on 429: sleep the server's `X-RateLimit-ToWait-Sec`, retry, and keep going for up to `csam_max_window_hops` (default 3) windows. A 100k pull now completes in one ~2-hour unattended run instead of needing two manual restarts. Per-page DB persistence (already in place via `on_page` checkpoint) makes any wait still crash-recoverable. Two new config knobs: `csam_max_window_hops` (default 3) and `csam_max_window_wait` (default 3600s ceiling per individual hop).
+
+## 2026-04-15 — Data Explorer page
+**Area:** `templates/data_explorer.html`, `app.py` (new routes), `templates/base.html` (nav)
+**Why:** Operators needed visibility into the raw data pulled from each Qualys API — what's actually in each table, how many rows, what snapshots exist, and the ability to search/browse/export. New `/data-explorer` page shows per-table summary cards (row counts, latest pull timestamp, DB size, snapshot count), a table browser with search + pagination + CSV export, a per-table column schema reference (API source + column descriptions), and a snapshot history view showing every `fetched_at` across all four raw tables. Added to the main nav between Query and Settings.
+
+## 2026-04-15 — DB architecture diagram in README
+**Area:** `README.md`
+**Why:** Added a detailed ASCII architecture diagram showing the complete data flow: Qualys APIs → parallel refresh pipeline (3 workers) → SQLite tables. Covers the snapshot model, cross-source `ip_address` join, tag normalization, per-page CSAM persistence, per-API failure isolation, derived tables (detection_changes, weekly/monthly rollups), configuration tables, views, and the GFS retention strategy. Gives operators and future developers a single-page overview of the entire data architecture.
+
+## 2026-04-15 — 6-Pack SQL performance: N+1 elimination + IN() chunking
+**Area:** `src/analytics.py`, `app.py`
+**Why:** The Cyber 6-Pack page was triggering "too many SQL variables" errors on production (104k hosts). Root cause was two bugs: (1) Three methods (`_resolve_group_ips`, `cve_by_ownership`, `orphaned_assets`) and one route (`api_unassigned`) still looped `db.get_asset_owner(ip)` per-IP instead of using the existing `_batch_resolve_owners()` helper — ~104k sequential queries per endpoint, each internally running up to 5 sub-queries. (2) `IN(?,?,?,...N)` placeholder construction with no chunking hit SQLite's `SQLITE_MAX_VARIABLE_NUMBER` limit when any ownership group contained >999 IPs. Fix: rewired all four N+1 sites to use `_batch_resolve_owners`; added `_chunked_in_query` and `_chunked_agg_query` helpers that split IP lists into batches of 900; updated `_six_pack_metrics_for_ips`, `cve_by_ownership`, `waterfall_by_ownership`, and related methods to use the chunked helpers. Also converted cross-chunk-unsafe `AVG()` aggregations to `SUM/COUNT` pairs for correct merging.
+
+## 2026-04-14 — Raised 429 retry ceiling from 900s to 7200s
+**Area:** `src/api_client.py::_csam_request`
+**Why:** Observed a production tenant return `X-RateLimit-ToWait-Sec: 2810` on a 429. Our previous clamp of 900s meant we slept 15 min, retried, and got a second 429 because the window hadn't reset yet — and the retry path only gets one shot. Ceiling raised to 7200s (2h) so we honour the server's reported value; the 2h upper bound is only a sanity guard against a malformed header. Default-fallback path (no header) still clamps at 120s.
+
 ## 2026-04-14 — Parallel refresh + partial-status tests
 **Area:** `tests/test_parallel_refresh.py`
 **Why:** Locks the invariants the new refresh pipeline depends on: CSAM failure must not cancel the VM threads (per-API failure isolation), row-level status classifies correctly into success / partial / failed, live-updating `csam_count` moves while `status='running'`, and the three-tier CSAM throttle (WARN<50 dedup'd per window, WARN+0.5s slow-down at <=10, hard-wait ToWait-Sec at <=2) behaves as designed.
