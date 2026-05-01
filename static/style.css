@@ -543,3 +543,11 @@ a.metric-card:hover { border-color: var(--accent); transform: translateY(-1px); 
 .refresh-api-failed    { color: #fecaca; }
 .refresh-api-cancelled { color: #d1d5db; }
 .refresh-api-pending   { color: inherit; opacity: 0.9; }
+
+/* Danger Zone card on the Settings page — outlined in the danger
+   colour so destructive operations are visually distinct from the
+   benign cards above them. */
+.danger-zone {
+    border: 1px solid var(--danger, #dc2626);
+    border-left-width: 3px;
+}

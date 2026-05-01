@@ -1318,6 +1318,71 @@ class QualysDADatabase:
         logger.info(f"Purged {cursor.rowcount} weekly rollups older than {weeks}w")
         return cursor.rowcount
 
+    # ── Full Wipe ────────────────────────────────────────────────
+    #
+    # Destructive: removes all ingested data + operational state.
+    # Caller is responsible for cancelling any in-flight refresh first
+    # (use `DataManager.purge_all(...)` which handles that orchestration).
+    # Wiping while a refresh is mid-write risks foreign-key-like join
+    # corruption and unstable counts.
+    #
+    # The schema is preserved (this is `DELETE`, not `DROP TABLE`) so
+    # the next refresh can begin immediately without re-running
+    # `_init_schema`.
+
+    # Tables in order — ingested data first, operational state last,
+    # config tables only if include_config=True.
+    _PURGE_DATA_TABLES = (
+        "csam_assets", "vm_hosts", "vm_detections", "host_tags",
+        "detection_changes", "weekly_rollups", "monthly_rollups",
+    )
+    _PURGE_OPS_TABLES = (
+        "refresh_log", "health_log", "csam_checkpoint",
+    )
+    _PURGE_CONFIG_TABLES = (
+        "asset_owners", "sla_targets", "saved_queries",
+    )
+
+    def purge_all_data(self, *, include_config: bool = False) -> Dict[str, int]:
+        """Wipe ALL ingested + operational data from the database.
+
+        Always wiped:
+          - Snapshot tables (csam_assets, vm_hosts, vm_detections, host_tags)
+          - Derived history (detection_changes, weekly_rollups, monthly_rollups)
+          - Operational state (refresh_log, health_log, csam_checkpoint)
+
+        Wiped only when `include_config=True`:
+          - asset_owners, sla_targets, saved_queries
+
+        Returns a dict mapping table name → rows deleted. The schema
+        itself is left intact.
+        """
+        counts: Dict[str, int] = {}
+        tables = list(self._PURGE_DATA_TABLES) + list(self._PURGE_OPS_TABLES)
+        if include_config:
+            tables += list(self._PURGE_CONFIG_TABLES)
+        for table in tables:
+            cursor = self.conn.execute(f"DELETE FROM {table}")
+            counts[table] = cursor.rowcount or 0
+        self.conn.commit()
+        # SQLite leaves the file size unchanged after DELETE; VACUUM
+        # reclaims it. Cheap on an empty DB; can take seconds on a
+        # multi-GB one but the operator just asked to wipe so the wait
+        # is acceptable.
+        try:
+            self.conn.execute("VACUUM")
+        except Exception as e:
+            # VACUUM can fail under WAL mode with active transactions;
+            # the data is already gone, so log and move on.
+            logger.warning(f"VACUUM after purge_all_data failed: {e}")
+        total = sum(counts.values())
+        logger.warning(
+            f"PURGE ALL DATA: removed {total:,} rows across "
+            f"{len(tables)} tables (include_config={include_config}): "
+            f"{counts}"
+        )
+        return counts
+
     def get_refresh_log(self, limit: int = 20) -> List[Dict]:
         rows = self.conn.execute(
             "SELECT * FROM refresh_log ORDER BY started_at DESC LIMIT ?", (limit,)

@@ -99,8 +99,47 @@ def cmd_export(args, manager):
 
 
 def cmd_purge(args, manager):
-    """Purge old data per GFS retention policy."""
+    """Purge data — either GFS retention (default) or full wipe (--all)."""
     dry_run = args.dry_run
+
+    # ── Full-wipe path ───────────────────────────────────────────
+    # Requires --all and a confirmation prompt unless --yes is passed.
+    # Cancels in-flight refreshes first via the orchestrator; see
+    # DataManager.purge_all() docstring.
+    if getattr(args, "all", False):
+        include_config = getattr(args, "include_config", False)
+        if dry_run:
+            print("DRY RUN — would wipe all ingested data" +
+                  (" + config tables (asset_owners, sla_targets, "
+                   "saved_queries)" if include_config else ""))
+            stats = manager.db.get_db_stats()
+            print(f"  Current DB size: {stats.get('db_size_mb', 0)} MB")
+            return 0
+        if not getattr(args, "yes", False):
+            print("WARNING: This will delete ALL ingested data" +
+                  (" AND config tables (ownership rules, SLA, saved queries)"
+                   if include_config else "") + ".")
+            print("Type DELETE to confirm: ", end="", flush=True)
+            try:
+                resp = input().strip()
+            except EOFError:
+                resp = ""
+            if resp != "DELETE":
+                print("Aborted.")
+                return 1
+        print("Cancelling any in-flight refresh and wiping...")
+        result = manager.purge_all(include_config=include_config)
+        if result["cancel_was_needed"]:
+            print(f"  Refresh cancellation: "
+                  f"{'completed' if result['cancel_completed'] else 'TIMED OUT'}")
+        total = sum(result["purged_counts"].values())
+        print(f"Purged {total:,} rows across "
+              f"{len(result['purged_counts'])} tables:")
+        for table, count in result["purged_counts"].items():
+            print(f"  {table}: {count:,} rows deleted")
+        return 0
+
+    # ── Retention purge (default) ────────────────────────────────
     if dry_run:
         print("DRY RUN — showing what would be purged:")
 
@@ -183,8 +222,30 @@ def main():
     export_parser.add_argument("--output", default="./exports/", help="Output directory")
 
     # purge
-    purge_parser = subparsers.add_parser("purge", help="Purge old data (GFS retention)")
-    purge_parser.add_argument("--dry-run", action="store_true", help="Show what would be purged without executing")
+    purge_parser = subparsers.add_parser(
+        "purge",
+        help="Purge data — old (GFS retention, default) or all (--all)",
+    )
+    purge_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be purged without executing",
+    )
+    purge_parser.add_argument(
+        "--all", action="store_true",
+        help=("DESTRUCTIVE: wipe ALL ingested data (snapshot tables, rollups, "
+              "change log, refresh log, heartbeats, CSAM checkpoint). "
+              "Cancels any in-flight refresh first. Requires interactive "
+              "DELETE confirmation unless --yes is also passed."),
+    )
+    purge_parser.add_argument(
+        "--include-config", action="store_true",
+        help=("With --all, also wipe configuration tables (asset_owners, "
+              "sla_targets, saved_queries). Use for a full factory reset."),
+    )
+    purge_parser.add_argument(
+        "--yes", action="store_true",
+        help="Skip the interactive DELETE prompt (use with --all in scripts).",
+    )
 
     # status
     subparsers.add_parser("status", help="Show DB stats and refresh history")

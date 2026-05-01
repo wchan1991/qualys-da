@@ -11,6 +11,7 @@ import csv
 import io
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
@@ -74,6 +75,69 @@ class DataManager:
 
     def is_cancel_requested(self) -> bool:
         return self._cancel_event.is_set()
+
+    # ── Full Wipe Orchestrator ───────────────────────────────────
+    #
+    # Cancels any in-flight refresh first (using the cancel-event we
+    # ship for refresh cancellation), waits up to N seconds for the
+    # refresh to actually terminate, then wipes the DB. Without this
+    # cancel-first step, purging while CSAM is mid-pull would yank
+    # tables out from under the writer and leave the checkpoint
+    # pointing at a snapshot_fetched_at that no longer exists.
+
+    def purge_all(self, *,
+                  include_config: bool = False,
+                  cancel_wait_seconds: float = 30.0) -> Dict[str, Any]:
+        """Cancel any running refresh, then wipe all ingested data.
+
+        Returns a dict with:
+          - cancel_was_needed: bool — did we have to interrupt a refresh?
+          - cancel_completed: bool — did it stop within the wait window?
+          - purged_counts: dict of table → rows-deleted
+          - include_config: bool — whether config tables were also wiped
+
+        See `db.purge_all_data` for the table list. Schema is preserved
+        (delete + VACUUM, not DROP TABLE) so the next refresh can begin
+        immediately.
+        """
+        result: Dict[str, Any] = {
+            "cancel_was_needed": False,
+            "cancel_completed": True,
+            "include_config": include_config,
+        }
+        # Step 1: if a refresh is running, signal cancel and wait for it
+        # to actually stop. The cancel_event interrupts a 47-min CSAM
+        # window-hop sleep instantly; per-page cancel checks pick up the
+        # signal between pages for VM and CSAM workers.
+        rows = self.db.get_refresh_log(limit=1)
+        if rows and rows[0].get("status") == "running":
+            result["cancel_was_needed"] = True
+            logger.warning(
+                "Purge requested with refresh in flight — cancelling first"
+            )
+            self.request_cancel()
+            deadline = time.monotonic() + cancel_wait_seconds
+            while time.monotonic() < deadline:
+                rows = self.db.get_refresh_log(limit=1)
+                if not rows or rows[0].get("status") != "running":
+                    break
+                time.sleep(0.5)
+            else:
+                result["cancel_completed"] = False
+                logger.warning(
+                    f"Refresh still 'running' after {cancel_wait_seconds}s "
+                    f"wait. Proceeding with purge — the in-flight worker "
+                    f"will fail on its next DB write, which is acceptable "
+                    f"since we're wiping anyway."
+                )
+        # Step 2: wipe.
+        result["purged_counts"] = self.db.purge_all_data(
+            include_config=include_config,
+        )
+        # Step 3: drop the analytics cache so the next page render
+        # doesn't show stale numbers from the deleted snapshot.
+        self.analytics.invalidate_cache()
+        return result
 
     def close(self):
         if self._client:

@@ -313,6 +313,41 @@ def api_refresh_source(source):
     return {"status": "refresh_started", "source": source}
 
 
+@app.route("/api/purge/all", methods=["POST"])
+@api_response
+def api_purge_all():
+    """DESTRUCTIVE: wipe all ingested + operational data from the database.
+
+    Required query params:
+      confirm=YES     — guards against accidental clicks (must be exact case)
+      include_config  — optional 'true' to also wipe asset_owners, sla_targets,
+                        saved_queries (full factory reset)
+
+    Behaviour:
+      1. If a refresh is in flight, send a cancel signal and wait up to
+         30s for it to stop (the cancel_event interrupts CSAM 429 sleeps
+         instantly; VM workers stop at the next page boundary).
+      2. DELETE FROM all snapshot tables, derived history, operational
+         state. Schema is preserved (no DROP TABLE), so the next refresh
+         can begin immediately.
+      3. VACUUM to reclaim the file-size on disk.
+
+    Returns a summary of rows deleted per table + whether cancel was
+    needed. Caller is expected to surface this in the UI so operators
+    see what happened.
+    """
+    if request.args.get("confirm") != "YES":
+        return {
+            "error": "Add ?confirm=YES to confirm the purge. This is a "
+                     "destructive operation — all ingested data will be "
+                     "deleted.",
+        }
+    include_config = request.args.get("include_config", "").lower() == "true"
+    manager = get_manager()
+    result = manager.purge_all(include_config=include_config)
+    return result
+
+
 @app.route("/api/refresh/cancel", methods=["POST"])
 @api_response
 def api_refresh_cancel():

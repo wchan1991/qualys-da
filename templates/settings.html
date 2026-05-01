@@ -109,6 +109,58 @@
         </table>
     </div>
 </div>
+
+<!-- Danger Zone -->
+<div class="card danger-zone">
+    <div class="card-header" style="color:var(--danger,#dc2626);">
+        Danger Zone
+        <span style="font-weight:normal;font-size:12px;color:var(--text-muted);margin-left:8px;">
+            Destructive operations — read carefully before clicking
+        </span>
+    </div>
+    <p style="color:var(--text-secondary);margin-bottom:12px;">
+        Wipe all ingested data from the database. Any in-flight refresh is
+        cancelled first. The schema is preserved, so you can refresh again
+        immediately afterwards.
+    </p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+            <input type="checkbox" id="purge-include-config">
+            Also wipe configuration (ownership rules, SLA targets, saved queries)
+        </label>
+    </div>
+    <button id="purge-all-btn" class="btn" style="background:var(--danger,#dc2626);color:white;border-color:var(--danger,#dc2626);" onclick="openPurgeModal()">Purge all data...</button>
+</div>
+
+<!-- Purge Confirmation Modal -->
+<div id="purge-modal"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:var(--bg-primary);border:1px solid var(--border-color);border-radius:8px;padding:24px;max-width:480px;width:90%;">
+        <h3 style="margin-top:0;color:var(--danger,#dc2626);">Confirm full purge</h3>
+        <p style="color:var(--text-secondary);">
+            This will delete <strong>all</strong> ingested data. This cannot be undone.
+        </p>
+        <div id="purge-modal-summary" style="font-size:13px;color:var(--text-muted);margin-bottom:12px;"></div>
+        <p style="margin:12px 0 6px 0;font-size:13px;">
+            Type <code style="background:var(--bg-secondary);padding:2px 6px;border-radius:3px;">DELETE</code> below to confirm:
+        </p>
+        <input type="text" id="purge-confirm-input"
+               class="input"
+               style="width:100%;font-family:monospace;"
+               placeholder="DELETE"
+               oninput="onPurgeConfirmInput()"
+               autocomplete="off">
+        <div id="purge-modal-result" style="margin-top:12px;font-size:13px;"></div>
+        <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
+            <button class="btn" onclick="closePurgeModal()">Cancel</button>
+            <button id="purge-modal-confirm-btn"
+                    class="btn"
+                    style="background:var(--danger,#dc2626);color:white;border-color:var(--danger,#dc2626);"
+                    disabled
+                    onclick="executePurge()">Wipe everything</button>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -261,5 +313,83 @@ loadHealthLog();
 // Refresh both cards every 30s so an in-flight refresh (or new heartbeat)
 // shows up without manual reload.
 setInterval(() => { loadIngestionStats(); loadHealthLog(); }, 30000);
+
+// ── Danger Zone: purge all data ──────────────────────────────
+//
+// Two-step confirm: button → modal → type DELETE → confirm. The API
+// route also requires ?confirm=YES so the wipe can't fire from a
+// stray fetch. Cancel-in-flight-refresh is handled server-side by
+// the manager.purge_all() orchestrator.
+
+function openPurgeModal() {
+    const modal = document.getElementById('purge-modal');
+    const summary = document.getElementById('purge-modal-summary');
+    const includeConfig = document.getElementById('purge-include-config').checked;
+    summary.innerHTML = includeConfig
+        ? '<strong>Including config tables:</strong> asset_owners, sla_targets, saved_queries will also be wiped.'
+        : 'Configuration tables (ownership rules, SLA, saved queries) will be <strong>preserved</strong>.';
+    document.getElementById('purge-confirm-input').value = '';
+    document.getElementById('purge-modal-confirm-btn').disabled = true;
+    document.getElementById('purge-modal-result').textContent = '';
+    modal.style.display = 'flex';
+    // Focus the confirm input so the operator can type immediately.
+    setTimeout(() => document.getElementById('purge-confirm-input').focus(), 50);
+}
+
+function closePurgeModal() {
+    document.getElementById('purge-modal').style.display = 'none';
+}
+
+function onPurgeConfirmInput() {
+    const val = document.getElementById('purge-confirm-input').value;
+    document.getElementById('purge-modal-confirm-btn').disabled = (val !== 'DELETE');
+}
+
+async function executePurge() {
+    const btn = document.getElementById('purge-modal-confirm-btn');
+    const resultEl = document.getElementById('purge-modal-result');
+    const includeConfig = document.getElementById('purge-include-config').checked;
+    btn.disabled = true;
+    btn.textContent = 'Wiping…';
+    resultEl.textContent = 'Cancelling any in-flight refresh and purging...';
+    try {
+        const params = new URLSearchParams({ confirm: 'YES' });
+        if (includeConfig) params.set('include_config', 'true');
+        const resp = await fetch('/api/purge/all?' + params, { method: 'POST' });
+        const data = await resp.json();
+        if (data.error) {
+            resultEl.style.color = 'var(--danger, #dc2626)';
+            resultEl.textContent = 'Error: ' + data.error;
+            btn.disabled = false;
+            btn.textContent = 'Wipe everything';
+            return;
+        }
+        const total = Object.values(data.purged_counts || {}).reduce((a, b) => a + b, 0);
+        const cancelMsg = data.cancel_was_needed
+            ? (data.cancel_completed
+               ? ' (in-flight refresh cancelled cleanly)'
+               : ' (refresh did not stop in time — proceeded anyway)')
+            : '';
+        resultEl.style.color = 'var(--success, #16a34a)';
+        resultEl.innerHTML = `Wiped ${total.toLocaleString()} rows${cancelMsg}.<br>Reloading...`;
+        showToast(`Purged ${total.toLocaleString()} rows from ${Object.keys(data.purged_counts).length} tables`, 'success');
+        // Give the success message ~1.5s of read-time, then reload
+        // so every card on the page reflects the empty state.
+        setTimeout(() => window.location.reload(), 1500);
+    } catch (e) {
+        resultEl.style.color = 'var(--danger, #dc2626)';
+        resultEl.textContent = 'Purge failed: ' + e.message;
+        btn.disabled = false;
+        btn.textContent = 'Wipe everything';
+    }
+}
+
+// Allow Esc to close the modal
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        const modal = document.getElementById('purge-modal');
+        if (modal && modal.style.display === 'flex') closePurgeModal();
+    }
+});
 </script>
 {% endblock %}
