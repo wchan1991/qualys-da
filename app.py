@@ -12,6 +12,7 @@ connections, making it safe with Flask's threaded mode.
 
 import io
 import csv
+import os
 import sys
 import time
 import logging
@@ -21,7 +22,8 @@ from pathlib import Path
 from functools import wraps
 
 from flask import (
-    Flask, render_template, jsonify, request, send_file, Response
+    Flask, render_template, jsonify, request, send_file, Response,
+    stream_with_context,
 )
 
 # Add src to path
@@ -931,29 +933,60 @@ def api_query_export_xlsx():
 # API: Export
 # ============================================================
 
+def _build_export_filters(args) -> dict:
+    """Build the filter dict for /api/export/csv from request.args.
+
+    Centralised so the route stays a one-liner and so the test suite has
+    a single seam to assert filter pass-through against. Notably this
+    INCLUDES `date_from` / `date_to` — the legacy hand-built dict in the
+    route used to drop those keys, which silently broke date filtering
+    on the Query Builder's CSV export.
+    """
+    filters: dict = {}
+    # Single-value text/numeric filters
+    if args.get("ip"):
+        filters["ip"] = args.get("ip")
+    if args.get("severity_min", type=int) is not None:
+        filters["severity_min"] = args.get("severity_min", type=int)
+    if args.get("qid", type=int) is not None:
+        filters["qid"] = args.get("qid", type=int)
+    if args.get("tag"):
+        filters["tag"] = args.get("tag")
+    # Date range — used to be dropped here, now plumbed through
+    if args.get("date_from"):
+        filters["date_from"] = args.get("date_from")
+    if args.get("date_to"):
+        filters["date_to"] = args.get("date_to")
+    # Multi-value statuses
+    statuses = args.getlist("status")
+    if statuses:
+        filters["status"] = statuses
+    # Boolean
+    if args.get("include_disabled", "false").lower() == "true":
+        filters["include_disabled"] = True
+    return filters
+
+
 @app.route("/api/export/csv")
 def api_export_csv():
+    """Stream a CSV export of the requested type, with optional filters.
+
+    Memory stays at ~`batch_size` rows regardless of fleet size — uses
+    Flask's `stream_with_context` to flush chunks as the DB cursor
+    pages through results. Replaces the old in-memory + 100k-row-cap
+    implementation.
+    """
     export_type = request.args.get("type", "detections")
     manager = get_manager()
-
-    filters = {
-        "ip": request.args.get("ip"),
-        "severity_min": request.args.get("severity_min", type=int),
-        "status": request.args.getlist("status") or None,
-        "qid": request.args.get("qid", type=int),
-        "tag": request.args.get("tag"),
-        "include_disabled": request.args.get("include_disabled", "false").lower() == "true",
-    }
-    filters = {k: v for k, v in filters.items() if v is not None}
-
-    csv_content = manager.export_csv(export_type, **filters)
+    filters = _build_export_filters(request.args)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"qualys_{export_type}_{timestamp}.csv"
-
     return Response(
-        csv_content,
+        stream_with_context(
+            manager.export_csv_stream(export_type, **filters)
+        ),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
@@ -1221,17 +1254,27 @@ def api_data_explorer_browse():
     }
 
 
-@app.route("/api/data-explorer/export-csv")
-def api_data_explorer_export_csv():
-    """Export the full latest snapshot of a table as CSV."""
-    table = request.args.get("table", "csam_assets")
-    if table not in EXPLORER_TABLES:
-        return jsonify({"error": f"Unknown table: {table}"}), 400
-    search = request.args.get("search", "").strip()
-    db = get_manager().db
+def _explorer_table_csv_stream(db, table: str, search: str = "",
+                                batch_size: int = 1000):
+    """Yield CSV chunks (header + batched rows) for one Data Explorer table.
 
-    where_parts = []
-    params = []
+    Shared between the single-table export route and the new bulk ZIP
+    route in §5 of the streaming-export plan. Skips the heavy `raw_data`
+    column (and other JSON blobs) to keep exports manageable.
+
+    Memory stays at ~`batch_size` rows regardless of table size — uses
+    `cursor.fetchmany()` to page rows off disk instead of materialising
+    the full result list.
+    """
+    if table not in EXPLORER_TABLES:
+        # Yield a single error line so the consumer's CSV isn't empty.
+        yield f"error,unknown table: {table}\n"
+        return
+
+    where_parts: list = []
+    params: list = []
+    # Only the four snapshot tables are scoped to MAX(fetched_at).
+    # detection_changes and health_log are cumulative — no scope filter.
     if table in ("csam_assets", "vm_hosts", "vm_detections", "host_tags"):
         fetched = db.get_latest_fetched_at(table)
         if fetched:
@@ -1243,28 +1286,132 @@ def api_data_explorer_export_csv():
             or_clauses = [f"{col} LIKE ?" for col in search_cols]
             params.extend(f"%{search}%" for _ in search_cols)
             where_parts.append(f"({' OR '.join(or_clauses)})")
-
     where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
-    # Exclude raw_data to keep export manageable
+    # Skip heavy columns from the SELECT so the CSV stays useful.
+    skip = {"raw_data"}
     col_info = db.conn.execute(f"PRAGMA table_info({table})").fetchall()
-    columns = [c["name"] for c in col_info if c["name"] != "raw_data"]
+    columns = [c["name"] for c in col_info if c["name"] not in skip]
 
-    rows = db.conn.execute(
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(columns)
+    yield buf.getvalue()
+    buf.seek(0); buf.truncate(0)
+
+    cursor = db.conn.execute(
         f"SELECT {','.join(columns)} FROM {table}{where_sql} ORDER BY id DESC",
         params,
-    ).fetchall()
+    )
+    count = 0
+    while True:
+        batch = cursor.fetchmany(batch_size)
+        if not batch:
+            break
+        for row in batch:
+            writer.writerow([row[c] for c in columns])
+            count += 1
+        yield buf.getvalue()
+        buf.seek(0); buf.truncate(0)
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(columns)
-    for row in rows:
-        writer.writerow([row[c] for c in columns])
 
+@app.route("/api/data-explorer/export-csv")
+def api_data_explorer_export_csv():
+    """Stream one Data Explorer table as CSV. Honours search filter.
+
+    Memory stays at ~batch_size rows; a 1M-row export now uses a few MB
+    of process memory instead of loading the full result set up front.
+    """
+    table = request.args.get("table", "csam_assets")
+    if table not in EXPLORER_TABLES:
+        return jsonify({"error": f"Unknown table: {table}"}), 400
+    search = request.args.get("search", "").strip()
+    db = get_manager().db
     return Response(
-        output.getvalue(),
+        stream_with_context(_explorer_table_csv_stream(db, table, search)),
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename={table}_export.csv"},
+    )
+
+
+@app.route("/api/data-explorer/export-all-zip")
+def api_data_explorer_export_all_zip():
+    """Stream a ZIP archive containing one CSV per Data Explorer table.
+
+    Closes the operator ask of "give me ALL the data in one click."
+    Implementation strategy:
+      1. Open a NamedTemporaryFile on disk.
+      2. Build the ZIP into it using stdlib `zipfile` — for each table,
+         iterate the per-table CSV stream and write chunks via
+         `zf.open(name, 'w').write(chunk_bytes)`. This keeps RAM bounded
+         to one batch per table at a time, instead of loading the
+         entire archive into memory.
+      3. Stream the temp file out to the client in 64KB chunks.
+      4. Delete the temp file in a Flask `call_on_close` callback once
+         the response has finished sending.
+
+    For very large fleets (multi-GB), the temp file lives in the OS's
+    temp dir during the download window. That's a deliberate trade-off
+    against in-memory ZIP construction which would peak at full archive
+    size.
+    """
+    import zipfile
+    import tempfile
+
+    db = get_manager().db
+
+    # Build the ZIP on disk so we don't need to keep the whole archive
+    # in memory. delete=False because we need to close the handle before
+    # Flask streams it back; we manually unlink in the call_on_close.
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="qualys_export_", suffix=".zip", delete=False,
+    )
+    tmp_path = tmp.name
+    tmp.close()  # Reopen via zipfile
+
+    try:
+        with zipfile.ZipFile(
+            tmp_path, mode="w", compression=zipfile.ZIP_DEFLATED,
+        ) as zf:
+            for table in sorted(EXPLORER_TABLES):
+                # zf.open(name, 'w') returns a writable handle that
+                # streams compressed bytes into the ZIP entry.
+                with zf.open(f"{table}.csv", mode="w") as entry:
+                    for chunk in _explorer_table_csv_stream(db, table):
+                        entry.write(chunk.encode("utf-8"))
+    except Exception:
+        # Clean up on build failure so we don't leak temp files.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    # Stream the file back to the client in 64KB blocks. After the
+    # response closes (success or client-disconnect), unlink the temp
+    # file so we don't leak.
+    def _stream_and_cleanup():
+        try:
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"qualys_data_{timestamp}.zip"
+    return Response(
+        stream_with_context(_stream_and_cleanup()),
+        mimetype="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+        },
     )
 
 

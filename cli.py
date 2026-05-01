@@ -80,7 +80,9 @@ def cmd_refresh(args, manager):
 
 
 def cmd_export(args, manager):
-    """Export data to CSV."""
+    """Export data to CSV — streams chunks to disk so memory stays
+    bounded regardless of fleet size. No row cap (the legacy
+    `export_csv` capped at 100k and silently truncated big fleets)."""
     export_type = args.type
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -89,12 +91,22 @@ def cmd_export(args, manager):
     filename = output_dir / f"qualys_{export_type}_{timestamp}.csv"
 
     print(f"Exporting {export_type} to {filename}...")
-    csv_content = manager.export_csv(export_type)
-
+    rows_written = 0
     with open(filename, "w", newline="", encoding="utf-8") as f:
-        f.write(csv_content)
+        for chunk in manager.export_csv_stream(export_type):
+            f.write(chunk)
+            # Each chunk is one batch worth of CSV lines; the row count
+            # progress is approximate (header + line breaks count toward
+            # the chunk) but useful for long-running exports.
+            rows_written += chunk.count("\n")
 
-    print(f"Exported to {filename}")
+    # Subtract 1 for the header row we wrote first.
+    estimated_rows = max(0, rows_written - 1)
+    size_mb = filename.stat().st_size / (1024 * 1024)
+    print(
+        f"Exported to {filename} "
+        f"(~{estimated_rows:,} rows, {size_mb:.1f} MB)"
+    )
     return 0
 
 

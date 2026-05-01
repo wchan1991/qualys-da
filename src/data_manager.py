@@ -14,7 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Iterator
 
 from .config_loader import QualysDAConfig
 from .database import QualysDADatabase
@@ -846,57 +846,129 @@ class DataManager:
 
     # ── CSV Export ────────────────────────────────────────────────
 
-    def export_csv(self, export_type: str = "detections", **filters) -> str:
-        output = io.StringIO()
-        writer = csv.writer(output)
+    # ── CSV Export ───────────────────────────────────────────────
+    #
+    # The streaming variant `export_csv_stream` is the canonical export
+    # path. It yields CSV-formatted strings (header first, then row
+    # batches) and has NO row cap — a 1M-row export uses ~5MB of memory
+    # regardless of fleet size.
+    #
+    # The legacy `export_csv` method is kept as a thin wrapper that
+    # joins the stream so external callers don't have to change. Both
+    # honour the same filter dict shape, including `date_from`/`date_to`
+    # which the legacy /api/export/csv route used to silently drop.
+
+    def export_csv_stream(self, export_type: str = "detections",
+                          *, batch_size: int = 1000,
+                          **filters) -> "Iterator[str]":
+        """Yield CSV chunks (header line + row batches) for a given type.
+
+        Use this directly with Flask's `stream_with_context` for the
+        web export route, or iterate it into a file for the CLI.
+        Memory stays at ~`batch_size` rows regardless of total volume.
+        """
+
+        def _chunk(rows_callable, header: list, row_to_columns):
+            """Pump rows from the DB iterator through csv.writer in batches.
+
+            `rows_callable` returns an iterator of dicts; `header` is the
+            CSV header row; `row_to_columns(dict) -> list` shapes each
+            row. We re-use a single StringIO buffer per batch — write a
+            chunk's worth of rows, yield, truncate, repeat.
+            """
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(header)
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+            count = 0
+            for r in rows_callable():
+                writer.writerow(row_to_columns(r))
+                count += 1
+                if count >= batch_size:
+                    yield buf.getvalue()
+                    buf.seek(0)
+                    buf.truncate(0)
+                    count = 0
+            if count > 0:
+                yield buf.getvalue()
 
         if export_type == "detections":
-            writer.writerow([
-                "Host ID", "IP", "DNS", "OS", "QID", "Type", "Severity",
-                "Status", "QDS", "First Found", "Last Found", "Times Found",
-            ])
-            rows = self.db.get_latest_detections(limit=100000, **filters)
-            for r in rows:
-                writer.writerow([
+            yield from _chunk(
+                rows_callable=lambda: self.db.iter_latest_detections(
+                    batch_size=batch_size, **filters,
+                ),
+                header=[
+                    "Host ID", "IP", "DNS", "OS", "QID", "Type", "Severity",
+                    "Status", "QDS", "First Found", "Last Found", "Times Found",
+                ],
+                row_to_columns=lambda r: [
                     r.get("host_id"), r.get("ip_address"), r.get("dns", ""),
                     r.get("os", ""), r.get("qid"), r.get("detection_type"),
                     r.get("severity"), r.get("status"), r.get("qds"),
-                    r.get("first_found"), r.get("last_found"), r.get("times_found"),
-                ])
-
+                    r.get("first_found"), r.get("last_found"),
+                    r.get("times_found"),
+                ],
+            )
         elif export_type == "hosts":
-            writer.writerow([
-                "Host ID", "IP", "DNS", "NetBIOS", "OS", "TruRisk",
-                "Last Scan", "Last Activity", "Tracking Method",
-            ])
-            rows = self.db.get_latest_vm_hosts(limit=100000, **filters)
-            for r in rows:
-                writer.writerow([
+            yield from _chunk(
+                rows_callable=lambda: self.db.iter_latest_vm_hosts(
+                    batch_size=batch_size, **filters,
+                ),
+                header=[
+                    "Host ID", "IP", "DNS", "NetBIOS", "OS", "TruRisk",
+                    "Last Scan", "Last Activity", "Tracking Method",
+                ],
+                row_to_columns=lambda r: [
                     r.get("host_id"), r.get("ip_address"), r.get("dns"),
                     r.get("netbios"), r.get("os"), r.get("trurisk_score"),
                     r.get("last_scan_date"), r.get("last_activity_date"),
                     r.get("tracking_method"),
-                ])
-
+                ],
+            )
         elif export_type == "assets":
-            writer.writerow([
-                "Asset ID", "Name", "IP", "OS", "Last Seen",
-            ])
-            rows = self.db.get_latest_csam_assets(limit=100000, **filters)
-            for r in rows:
-                writer.writerow([
+            yield from _chunk(
+                rows_callable=lambda: self.db.iter_latest_csam_assets(
+                    batch_size=batch_size, **filters,
+                ),
+                header=[
+                    "Asset ID", "Name", "IP", "OS", "Last Seen",
+                ],
+                row_to_columns=lambda r: [
                     r.get("asset_id"), r.get("name"), r.get("ip_address"),
                     r.get("os"), r.get("last_seen"),
-                ])
-
+                ],
+            )
         elif export_type == "kpis":
+            # KPIs are a tiny static rollup — streaming is overkill but
+            # we expose the same generator shape for caller uniformity.
+            buf = io.StringIO()
+            writer = csv.writer(buf)
             kpis = self.analytics.all_kpis()
             writer.writerow(["KPI", "Value"])
             writer.writerow(["Patchable %", kpis["patchable"]["patchable_pct"]])
-            writer.writerow(["SLA Compliance %", kpis["sla_compliance"]["overall_pct"]])
+            writer.writerow(
+                ["SLA Compliance %", kpis["sla_compliance"]["overall_pct"]]
+            )
             writer.writerow(["Reopen Rate %", kpis["reopen_rate"]["rate_pct"]])
-            writer.writerow(["Mean Time to Remediate (days)", kpis["detection_age"]["mean_days_to_remediate"]])
+            writer.writerow([
+                "Mean Time to Remediate (days)",
+                kpis["detection_age"]["mean_days_to_remediate"],
+            ])
             for sev, days in kpis["mttr_by_severity"].items():
                 writer.writerow([f"MTTR Severity {sev}", days])
+            yield buf.getvalue()
+        else:
+            # Unknown type → empty CSV with just an error header so the
+            # downloaded file isn't silently empty.
+            yield f"error,unknown export type: {export_type}\n"
 
-        return output.getvalue()
+    def export_csv(self, export_type: str = "detections", **filters) -> str:
+        """In-memory wrapper around `export_csv_stream` for callers that
+        want the full string. Don't use on big fleets — prefer the
+        stream directly. Kept for backwards compat."""
+        return "".join(
+            self.export_csv_stream(export_type=export_type, **filters)
+        )

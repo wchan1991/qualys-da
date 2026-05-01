@@ -66,7 +66,8 @@
             <option value="250">250</option>
         </select>
         <button class="btn btn-primary" onclick="loadExplorerData();">Search</button>
-        <button class="btn" onclick="exportExplorerCSV();" title="Export current view to CSV">Export CSV</button>
+        <button class="btn" onclick="exportExplorerCSV();" title="Export current table (latest snapshot, with search filter) as CSV">Export CSV</button>
+        <button class="btn" onclick="exportAllTablesZip();" title="Stream a ZIP archive containing one CSV per table — every snapshot table at its latest fetched_at, plus detection_changes and health_log in full">Export all tables (ZIP)</button>
     </div>
 
     <!-- Data Table -->
@@ -364,6 +365,15 @@ function exportExplorerCSV() {
     const params = new URLSearchParams({ table: explorerCurrentTable });
     if (search) params.set('search', search);
     window.location.href = '/api/data-explorer/export-csv?' + params;
+}
+
+function exportAllTablesZip() {
+    // Fire as a top-level navigation so the browser shows its native
+    // download UI for the streamed ZIP. The server builds the archive
+    // on disk in a tempfile (see api_data_explorer_export_all_zip) and
+    // streams it back; bigger fleets will see a "Saving..." progress
+    // window while the ZIP is being assembled. No client-side state.
+    window.location.href = '/api/data-explorer/export-all-zip';
 }
 </script>
 {% endblock %}

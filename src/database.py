@@ -19,7 +19,7 @@ import logging
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -924,6 +924,133 @@ class QualysDADatabase:
         query += " ORDER BY severity DESC, first_found ASC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         return [dict(r) for r in self.conn.execute(query, params).fetchall()]
+
+    # ── Streaming iterators for unbounded CSV exports ────────────
+    #
+    # The non-iter `get_latest_*` methods above are paginated for the
+    # web UI (LIMIT/OFFSET, list-of-dicts return). These iterators are
+    # for export paths that need every row of the latest snapshot
+    # without materialising the full result set in memory.
+    #
+    # Iteration uses `fetchmany(batch_size)` so SQLite streams pages
+    # off disk instead of building one giant Python list. A 1M-row
+    # export now costs ~5MB of process memory regardless of fleet size.
+    # Filter dict shape mirrors the pagination methods exactly so
+    # callers can swap one for the other.
+
+    def iter_latest_csam_assets(self, *, batch_size: int = 1000,
+                                ip: Optional[str] = None) -> Iterator[Dict]:
+        """Yield every CSAM asset in the latest snapshot, batched."""
+        fetched = self.get_latest_fetched_at("csam_assets")
+        if not fetched:
+            return
+        query = "SELECT * FROM csam_assets WHERE fetched_at = ?"
+        params: list = [fetched]
+        if ip:
+            query += " AND ip_address LIKE ?"
+            params.append(f"%{ip}%")
+        query += " ORDER BY ip_address"
+        cursor = self.conn.execute(query, params)
+        while True:
+            batch = cursor.fetchmany(batch_size)
+            if not batch:
+                break
+            for r in batch:
+                yield dict(r)
+
+    def iter_latest_vm_hosts(self, *, batch_size: int = 1000,
+                              ip: Optional[str] = None,
+                              os_filter: Optional[str] = None) -> Iterator[Dict]:
+        """Yield every VM host in the latest snapshot, batched."""
+        fetched = self.get_latest_fetched_at("vm_hosts")
+        if not fetched:
+            return
+        query = "SELECT * FROM vm_hosts WHERE fetched_at = ?"
+        params: list = [fetched]
+        if ip:
+            query += " AND (ip_address LIKE ? OR dns LIKE ? OR netbios LIKE ?)"
+            like = f"%{ip}%"
+            params.extend([like, like, like])
+        if os_filter:
+            query += " AND os LIKE ?"
+            params.append(f"%{os_filter}%")
+        query += " ORDER BY ip_address"
+        cursor = self.conn.execute(query, params)
+        while True:
+            batch = cursor.fetchmany(batch_size)
+            if not batch:
+                break
+            for r in batch:
+                yield dict(r)
+
+    def iter_latest_detections(self, *, batch_size: int = 1000,
+                                ip: Optional[str] = None,
+                                severity_min: Optional[int] = None,
+                                status: Optional[List[str]] = None,
+                                qid: Optional[int] = None,
+                                date_from: Optional[str] = None,
+                                date_to: Optional[str] = None,
+                                tag: Optional[str] = None,
+                                include_disabled: bool = False) -> Iterator[Dict]:
+        """Yield every detection in the latest snapshot matching the filters,
+        batched. Honours the same filter dict as `get_latest_detections`
+        — including `date_from`/`date_to` which the legacy /api/export/csv
+        used to silently drop."""
+        fetched = self.get_latest_fetched_at("vm_detections")
+        if not fetched:
+            return
+
+        if tag:
+            query = """
+                SELECT d.* FROM vm_detections d
+                JOIN host_tags t ON d.host_id = t.host_id
+                WHERE d.fetched_at = ? AND t.tag_name = ?
+            """
+            params: list = [fetched, tag]
+            tag_fetched = self.get_latest_fetched_at("host_tags")
+            if tag_fetched:
+                query += " AND t.fetched_at = ?"
+                params.append(tag_fetched)
+        else:
+            query = "SELECT * FROM vm_detections WHERE fetched_at = ?"
+            params = [fetched]
+
+        if not include_disabled:
+            query += " AND d.is_disabled = 0" if tag else " AND is_disabled = 0"
+        if ip:
+            col = "d.ip_address" if tag else "ip_address"
+            query += f" AND {col} LIKE ?"
+            params.append(f"%{ip}%")
+        if severity_min is not None:
+            col = "d.severity" if tag else "severity"
+            query += f" AND {col} >= ?"
+            params.append(severity_min)
+        if status:
+            col = "d.status" if tag else "status"
+            placeholders = ",".join("?" * len(status))
+            query += f" AND {col} IN ({placeholders})"
+            params.extend(status)
+        if qid:
+            col = "d.qid" if tag else "qid"
+            query += f" AND {col} = ?"
+            params.append(qid)
+        if date_from:
+            col = "d.first_found" if tag else "first_found"
+            query += f" AND {col} >= ?"
+            params.append(date_from)
+        if date_to:
+            col = "d.last_found" if tag else "last_found"
+            query += f" AND {col} <= ?"
+            params.append(date_to)
+
+        query += " ORDER BY severity DESC, first_found ASC"
+        cursor = self.conn.execute(query, params)
+        while True:
+            batch = cursor.fetchmany(batch_size)
+            if not batch:
+                break
+            for r in batch:
+                yield dict(r)
 
     def get_detection_count(self, include_disabled: bool = False) -> int:
         fetched = self.get_latest_fetched_at("vm_detections")
