@@ -10,13 +10,16 @@ Coordinator singleton that orchestrates:
 import csv
 import io
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
 from .config_loader import QualysDAConfig
 from .database import QualysDADatabase
-from .api_client import QualysClient, QualysError, AuthError
+from .api_client import (
+    QualysClient, QualysError, AuthError, CancelledError,
+)
 from .analytics import AnalyticsEngine
 
 logger = logging.getLogger(__name__)
@@ -34,12 +37,43 @@ class DataManager:
         self.db = QualysDADatabase(config.db_path)
         self.analytics = AnalyticsEngine(self.db, config)
         self._client: Optional[QualysClient] = None
+        # Cooperative cancellation flag for in-flight refreshes.
+        # Set via `request_cancel()` (POST /api/refresh/cancel); cleared
+        # via `reset_cancel()` at the start of every refresh_all. The
+        # CSAM page loop, VM page loops, and the 429 window-hop sleep
+        # all check this flag at safe points and raise `CancelledError`
+        # so the refresh terminates cleanly with status='cancelled'.
+        self._cancel_event = threading.Event()
 
     @property
     def client(self) -> QualysClient:
         if self._client is None:
             self._client = QualysClient(self.config)
+            # Share the cancel event with the client so `_csam_request`'s
+            # multi-window sleep can be interrupted without waiting out
+            # a 47-minute ToWait-Sec.
+            self._client._cancel_event = self._cancel_event
         return self._client
+
+    # ── Cancellation API ─────────────────────────────────────────
+    #
+    # Called by the Flask route POST /api/refresh/cancel. Cooperative —
+    # the in-flight refresh checks the event at its next safe point
+    # (between pages, or when waking from a window-hop sleep) and exits
+    # with status='cancelled'. Already-persisted rows are kept; the CSAM
+    # checkpoint is preserved so the next refresh can resume.
+
+    def request_cancel(self) -> None:
+        """Signal any in-flight refresh to abort at its next checkpoint."""
+        logger.info("Cancellation requested for in-flight refresh")
+        self._cancel_event.set()
+
+    def reset_cancel(self) -> None:
+        """Clear the cancel flag — called at the start of every refresh_all."""
+        self._cancel_event.clear()
+
+    def is_cancel_requested(self) -> bool:
+        return self._cancel_event.is_set()
 
     def close(self):
         if self._client:
@@ -257,13 +291,18 @@ class DataManager:
         precede the parallel fan-out: a bad credential or an unreachable
         Qualys tenant will short-circuit before any thread is spawned.
         """
+        # Clear any leftover cancel signal from a prior run so this
+        # refresh starts cleanly. Must happen BEFORE log_refresh so a
+        # stale cancel from before the new refresh-id was created
+        # can't accidentally short-circuit it.
+        self.reset_cancel()
         refresh_id = self.db.log_refresh("all")
         now = datetime.utcnow().isoformat()
         counts = {"csam": 0, "vm_hosts": 0, "vm_detections": 0, "changes": 0}
 
         # Per-API outcome tracking. Starts as "skipped"; each thread
-        # flips its own slot to success/partial/failed as the result
-        # comes back. If the whole function short-circuits on auth
+        # flips its own slot to success/partial/failed/cancelled as the
+        # result comes back. If the whole function short-circuits on auth
         # failure these stay as "skipped", which is correct.
         outcomes = {"csam": "skipped", "vm_hosts": "skipped",
                     "vm_detections": "skipped"}
@@ -350,6 +389,23 @@ class DataManager:
                     return {"status": "success", "count": len(assets),
                             "data": assets, "snapshot": snapshot,
                             "error": None}
+                except CancelledError as e:
+                    # Operator-requested stop — distinct from failure.
+                    # CSAM saves per-page so already-fetched rows are
+                    # durable; the checkpoint preserves resume state.
+                    saved = 0
+                    try:
+                        cp = self.db.get_csam_checkpoint() or {}
+                        saved = int(cp.get("assets_pulled") or 0)
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"CSAM refresh cancelled: {e} "
+                        f"(saved {saved} assets, checkpoint preserved)"
+                    )
+                    return {"status": "cancelled", "count": saved,
+                            "data": None, "snapshot": None,
+                            "error": f"CancelledError: {e}"}
                 except Exception as e:
                     # CSAM saves inside on_page, so the checkpoint knows
                     # how many made it to disk. Use that to distinguish
@@ -386,6 +442,10 @@ class DataManager:
                     )
                     return {"status": "success", "count": len(hosts),
                             "data": hosts, "error": None}
+                except CancelledError as e:
+                    logger.info(f"VM hosts refresh cancelled: {e}")
+                    return {"status": "cancelled", "count": 0, "data": None,
+                            "error": f"CancelledError: {e}"}
                 except Exception as e:
                     logger.warning(
                         f"VM hosts refresh failed: {type(e).__name__}: {e}"
@@ -413,6 +473,10 @@ class DataManager:
                     )
                     return {"status": "success", "count": len(dets),
                             "data": dets, "error": None}
+                except CancelledError as e:
+                    logger.info(f"VM detections refresh cancelled: {e}")
+                    return {"status": "cancelled", "count": 0, "data": None,
+                            "error": f"CancelledError: {e}"}
                 except Exception as e:
                     logger.warning(
                         f"VM detections refresh failed: {type(e).__name__}: {e}"
@@ -466,19 +530,26 @@ class DataManager:
             # None), we skip the corresponding save — overwriting a good
             # table with an empty one would silently nuke the dashboard.
             counts["csam"] = csam_res["count"]
-            if hosts_res["status"] != "failed":
+            # Skip the save when the VM fetch failed OR was cancelled —
+            # both leave us with no data buffer to write, and overwriting
+            # a good prior snapshot with an empty one would silently nuke
+            # the dashboard.
+            no_save = ("failed", "cancelled")
+            if hosts_res["status"] not in no_save:
                 counts["vm_hosts"] = self.db.save_vm_hosts(vm_hosts, now)
             else:
                 logger.warning(
-                    "VM hosts save skipped: fetch failed, preserving prior snapshot."
+                    f"VM hosts save skipped: fetch {hosts_res['status']}, "
+                    f"preserving prior snapshot."
                 )
-            if dets_res["status"] != "failed":
+            if dets_res["status"] not in no_save:
                 counts["vm_detections"] = self.db.save_vm_detections(
                     vm_detections, now
                 )
             else:
                 logger.warning(
-                    "VM detections save skipped: fetch failed, preserving prior snapshot."
+                    f"VM detections save skipped: fetch {dets_res['status']}, "
+                    f"preserving prior snapshot."
                 )
 
             # Extract and save tags (only from sources we actually got data for).
@@ -510,8 +581,23 @@ class DataManager:
             self.analytics.purge_snapshots()
 
             # ── 5. Classify row-level status and write terminal state ──
+            #
+            # Precedence order:
+            #   1. Any 'cancelled' AND no 'success' → row 'cancelled'
+            #      (operator stopped the pull; preserve the intent in the
+            #      log so the partial-vs-cancelled distinction survives)
+            #   2. All 'success'                    → row 'success'
+            #   3. Only failed/skipped, no success  → row 'failed'
+            #   4. Anything mixed                   → row 'partial'
             statuses = set(outcomes.values())
-            if statuses == {"success"}:
+            if "cancelled" in statuses and "success" not in statuses:
+                row_status = "cancelled"
+                error_summary = "; ".join(
+                    f"{api}={outcomes[api]}"
+                    + (f"({errors[api]})" if api in errors else "")
+                    for api in ("csam", "vm_hosts", "vm_detections")
+                )
+            elif statuses == {"success"}:
                 row_status = "success"
                 error_summary = None
             elif statuses <= {"failed", "skipped"} and "success" not in statuses:

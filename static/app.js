@@ -201,9 +201,10 @@ setInterval(_heartbeatTick, 60000);
 // per-API outcome for 8s before hiding — so the operator never stares
 // at a stale dashboard wondering whether the last Refresh click took.
 function fmtApiBadge(label, status, count, expected) {
-    const icon = (status === 'success') ? '&#10003;'
-               : (status === 'partial') ? '&#9888;'
-               : (status === 'failed')  ? '&#10007;'
+    const icon = (status === 'success')   ? '&#10003;'
+               : (status === 'partial')   ? '&#9888;'
+               : (status === 'failed')    ? '&#10007;'
+               : (status === 'cancelled') ? '&#9203;'   // ⏳ stop / paused
                : '&middot;';
     const countStr = (count != null)
         ? (expected ? `${formatNumber(count)}/${formatNumber(expected)}`
@@ -212,9 +213,40 @@ function fmtApiBadge(label, status, count, expected) {
     return `<span class="refresh-api refresh-api-${status || 'pending'}">${icon} ${label} ${countStr}</span>`;
 }
 
+// Track the last polled refresh-id so the "cancel sent" UI state
+// resets cleanly when a new refresh starts.
+let _refreshCancelInFlight = false;
+
+async function cancelInFlightRefresh() {
+    if (_refreshCancelInFlight) return;
+    _refreshCancelInFlight = true;
+    const btn = document.getElementById('refresh-cancel-btn');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Cancelling…';
+    }
+    try {
+        const resp = await fetch('/api/refresh/cancel', { method: 'POST' });
+        const data = await resp.json();
+        if (data.status === 'cancel_requested') {
+            showToast('Refresh cancel requested — will stop at next checkpoint',
+                      'success');
+        } else {
+            showToast(data.message || 'No active refresh to cancel', 'info');
+        }
+    } catch (e) {
+        showToast('Cancel failed: ' + e.message, 'error');
+    } finally {
+        // Re-enable after a short delay; the poller will hide the banner
+        // once the refresh row flips to terminal.
+        setTimeout(() => { _refreshCancelInFlight = false; }, 5000);
+    }
+}
+
 async function pollRefreshStatus() {
     const banner = document.getElementById('refresh-banner');
     const txt = document.getElementById('refresh-banner-text');
+    const cancelBtn = document.getElementById('refresh-cancel-btn');
     if (!banner || !txt) return;
 
     let row;
@@ -227,6 +259,13 @@ async function pollRefreshStatus() {
     if (!row) {
         banner.style.display = 'none';
         banner.className = 'refresh-banner';
+        if (cancelBtn) cancelBtn.style.display = 'none';
+        // Reset the cancel-button state so the next refresh starts clean.
+        _refreshCancelInFlight = false;
+        if (cancelBtn) {
+            cancelBtn.disabled = false;
+            cancelBtn.textContent = 'Cancel';
+        }
         return;
     }
 
@@ -244,11 +283,18 @@ async function pollRefreshStatus() {
         ? 'Refresh in progress — showing last snapshot'
         : (row.status === 'partial'
            ? 'Refresh completed with partial data'
-           : (row.status === 'failed' ? 'Refresh failed' : 'Refresh complete'));
+           : (row.status === 'cancelled'
+              ? 'Refresh cancelled — saved rows preserved'
+              : (row.status === 'failed' ? 'Refresh failed' : 'Refresh complete')));
     txt.innerHTML = `<strong>${prefix}</strong> · ${badges}`;
 
     banner.className = 'refresh-banner refresh-banner-' + (row.status || 'running');
     banner.style.display = '';
+
+    // Cancel button is only useful while the refresh is still running.
+    if (cancelBtn) {
+        cancelBtn.style.display = running ? '' : 'none';
+    }
 }
 
 pollRefreshStatus();

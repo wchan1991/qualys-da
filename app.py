@@ -313,6 +313,40 @@ def api_refresh_source(source):
     return {"status": "refresh_started", "source": source}
 
 
+@app.route("/api/refresh/cancel", methods=["POST"])
+@api_response
+def api_refresh_cancel():
+    """Signal any in-flight refresh to abort cooperatively.
+
+    Returns immediately — cancellation is checked at the next safe point
+    by each per-API worker (between pages, or when waking from a 429
+    window-hop sleep). The refresh row's `status` flips to `'cancelled'`
+    and per-API columns reflect which workers reached a cancel checkpoint
+    in time. Already-persisted rows (CSAM saves per-page) are kept; the
+    CSAM checkpoint preserves resume state so the next refresh can pick
+    up from the exact page where the cancel landed.
+    """
+    manager = get_manager()
+    db = manager.db
+    # Sanity check: only act if there's actually a running refresh.
+    rows = db.get_refresh_log(limit=1)
+    if not rows or rows[0].get("status") != "running":
+        return {
+            "status": "no_active_refresh",
+            "message": "No refresh is currently running.",
+        }
+    manager.request_cancel()
+    return {
+        "status": "cancel_requested",
+        "refresh_id": rows[0].get("id"),
+        "message": (
+            "Cancel signal sent. The refresh will abort at its next "
+            "page/checkpoint boundary; an in-flight 429 wait is "
+            "interrupted immediately. Saved rows are preserved."
+        ),
+    }
+
+
 # ============================================================
 # API: Dashboard
 # ============================================================

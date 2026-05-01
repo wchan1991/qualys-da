@@ -43,6 +43,23 @@ class RateLimitError(QualysError):
     pass
 
 
+class CancelledError(QualysError):
+    """Operator-requested refresh cancellation.
+
+    Raised by the CSAM page loop, the VM page loops, and the 429 window-hop
+    sleep when the DataManager's `_cancel_event` has been set (typically via
+    `POST /api/refresh/cancel`). Treated by `refresh_all` as a terminal
+    `cancelled` status — distinct from `failed` so the operator knows the
+    stop was intentional, not an error.
+
+    Already-persisted rows are kept (CSAM saves per-page; VM may lose its
+    in-memory buffer for the cancelled API). The CSAM checkpoint is
+    preserved so the next refresh can resume cleanly from where the cancel
+    interrupted.
+    """
+    pass
+
+
 @dataclass
 class RateLimiter:
     """Token bucket rate limiter. Thread-safe: `acquire()` is guarded by a lock
@@ -467,7 +484,20 @@ class QualysClient:
                     f"(Retry-After={retry_after!r}, "
                     f"X-RateLimit-ToWait-Sec={wait_hdr!r})"
                 )
-                time.sleep(sleep_for)
+                # Cooperative cancellation: if DataManager has set its
+                # _cancel_event (typically via POST /api/refresh/cancel),
+                # `Event.wait(timeout)` returns True immediately so the
+                # operator doesn't have to wait out a 47-minute ToWait-Sec.
+                # When no cancel event is attached, fall back to time.sleep.
+                cancel = getattr(self, "_cancel_event", None)
+                if cancel is not None:
+                    if cancel.wait(sleep_for):
+                        raise CancelledError(
+                            "CSAM refresh cancelled during 429 window-hop "
+                            f"wait (hop {hop}/{max_hops})"
+                        )
+                else:
+                    time.sleep(sleep_for)
                 response = session.request(
                     method=method, url=url, json=json_body, params=params,
                     timeout=timeout or self.config.timeout,
@@ -655,6 +685,7 @@ class QualysClient:
             logger.info("Fetching VM hosts...")
         all_hosts = []
         page = 0
+        cancel = getattr(self, "_cancel_event", None)
 
         response = self._vm_request(
             "POST",
@@ -670,6 +701,16 @@ class QualysClient:
         )
 
         while page < max_pages:
+            # Cooperative cancellation between pages. VM hosts buffer in
+            # memory (no per-page DB save like CSAM), so an in-flight buffer
+            # is lost on cancel — refresh_all marks vm_host_status='cancelled'
+            # rather than 'partial'. Operators can re-trigger via the
+            # "Refresh VM Hosts" button on Settings.
+            if cancel is not None and cancel.is_set():
+                raise CancelledError(
+                    f"VM hosts refresh cancelled at page {page} "
+                    f"({len(all_hosts)} hosts in buffer, NOT persisted)"
+                )
             page += 1
             hosts = self._parse_vm_hosts_xml(response.text)
             all_hosts.extend(hosts)
@@ -768,6 +809,7 @@ class QualysClient:
             logger.info("Fetching VM detections...")
         all_detections = []
         page = 0
+        cancel = getattr(self, "_cancel_event", None)
 
         response = self._vm_request(
             "POST",
@@ -783,6 +825,12 @@ class QualysClient:
         )
 
         while page < max_pages:
+            # Cooperative cancellation. Same buffer-loss caveat as VM hosts.
+            if cancel is not None and cancel.is_set():
+                raise CancelledError(
+                    f"VM detections refresh cancelled at page {page} "
+                    f"({len(all_detections)} detections in buffer, NOT persisted)"
+                )
             page += 1
             detections = self._parse_vm_detections_xml(response.text)
             all_detections.extend(detections)
@@ -949,8 +997,18 @@ class QualysClient:
         all_assets: List[Dict] = []
         last_seen_id: Optional[str] = resume_from_id
         page = 0
+        cancel = getattr(self, "_cancel_event", None)
 
         while page < max_pages:
+            # Cooperative cancellation check between pages. Already-fetched
+            # pages are durable (saved per-page in on_page); the CSAM
+            # checkpoint preserves last_asset_id + snapshot_fetched_at so
+            # a future refresh can resume cleanly from this exact spot.
+            if cancel is not None and cancel.is_set():
+                raise CancelledError(
+                    f"CSAM refresh cancelled at page {page} "
+                    f"({len(all_assets)} assets persisted)"
+                )
             page += 1
             body: Dict[str, Any] = {
                 "ServiceRequest": {

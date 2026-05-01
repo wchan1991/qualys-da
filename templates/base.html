@@ -63,6 +63,12 @@
          flight. -->
     <div id="refresh-banner" class="refresh-banner" style="display:none;">
         <span id="refresh-banner-text"></span>
+        <button type="button"
+                id="refresh-cancel-btn"
+                class="refresh-banner-cancel"
+                style="display:none;"
+                onclick="cancelInFlightRefresh()"
+                title="Stop the in-flight refresh at the next page boundary. Saved rows are kept.">Cancel</button>
         <button type="button" class="refresh-banner-close"
                 onclick="document.getElementById('refresh-banner').style.display='none';"
                 aria-label="Dismiss">&times;</button>
