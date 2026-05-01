@@ -36,6 +36,24 @@ log once landed.
   when a quota window caps us mid-pull.
 - [ ] **Per-tag / per-asset-group CSAM sharding** — split a >40k fleet
   across multiple cron windows (operator-configurable shard key).
+- [ ] **IP-uniqueness report card on Data Explorer** — surface the count of
+  IPs that map to multiple `asset_id`s in CSAM (multi-NIC hosts, virtual
+  IPs, NAT'd bastions). Today they're stored as distinct rows because they
+  are distinct assets per Qualys, but operators have asked to see the
+  magnitude at a glance. Single SQL query against
+  `csam_assets` GROUP BY ip_address HAVING COUNT(DISTINCT asset_id) > 1.
+- [ ] **Cross-source canonical IP view** — a `v_assets_unified` view that
+  picks one canonical row per IP across `csam_assets` ∪ `vm_hosts`, with
+  source-precedence rules (CSAM wins for inventory, VM wins for scan
+  state). Useful for analytics that need a single "is this IP managed?"
+  boolean rather than the current two source-of-truth columns. Does NOT
+  delete the underlying tables — purely a view layer.
+- [ ] **Tombstone detection for retired assets** — when an `asset_id`
+  appears in snapshot N-1 but not N, write a row to `detection_changes`
+  (or a new `asset_changes` table) so trend dashboards can distinguish
+  "host went silent" from "host was retired." Today retired hosts just
+  silently fall out of `MAX(fetched_at)` and trend lines drop without an
+  audit log entry.
 
 ---
 
