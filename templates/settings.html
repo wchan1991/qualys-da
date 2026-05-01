@@ -39,6 +39,26 @@
     </div>
 </div>
 
+<!-- Ingestion Statistics -->
+<div class="card">
+    <div class="card-header">
+        Ingestion Statistics
+        <span style="font-weight:normal;font-size:12px;color:var(--text-muted);margin-left:8px;">
+            "Look under the hood" — what's currently in the database
+        </span>
+    </div>
+    <div id="ingestion-stats-grid" class="kpi-grid" style="margin-bottom:0;">
+        <div class="kpi-card"><div class="kpi-label">CSAM Assets</div><div class="kpi-value" id="ig-csam">—</div><div class="kpi-detail" id="ig-csam-ts">—</div></div>
+        <div class="kpi-card"><div class="kpi-label">VM Hosts</div><div class="kpi-value" id="ig-hosts">—</div><div class="kpi-detail" id="ig-hosts-ts">—</div></div>
+        <div class="kpi-card"><div class="kpi-label">VM Detections</div><div class="kpi-value" id="ig-dets">—</div><div class="kpi-detail" id="ig-dets-ts">—</div></div>
+        <div class="kpi-card"><div class="kpi-label">Total Refreshes</div><div class="kpi-value" id="ig-refreshes">—</div><div class="kpi-detail" id="ig-refreshes-detail">—</div></div>
+        <div class="kpi-card"><div class="kpi-label">Success Rate</div><div class="kpi-value" id="ig-rate">—</div><div class="kpi-detail">success / terminal runs</div></div>
+        <div class="kpi-card"><div class="kpi-label">Avg Pull Duration</div><div class="kpi-value" id="ig-duration">—</div><div class="kpi-detail">success runs only</div></div>
+        <div class="kpi-card"><div class="kpi-label">Last Successful Pull</div><div class="kpi-value" id="ig-last">—</div><div class="kpi-detail" id="ig-last-detail">—</div></div>
+        <div class="kpi-card"><div class="kpi-label">DB File Size</div><div class="kpi-value" id="ig-size">—</div><div class="kpi-detail">on disk</div></div>
+    </div>
+</div>
+
 <!-- Recent Refresh History -->
 <div class="card">
     <div class="card-header">Recent Refresh History</div>
@@ -58,6 +78,33 @@
             </thead>
             <tbody id="refresh-log-body">
                 <tr><td colspan="8" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Recent Heartbeats -->
+<div class="card">
+    <div class="card-header">
+        Recent Heartbeats
+        <span style="font-weight:normal;font-size:12px;color:var(--text-muted);margin-left:8px;">
+            Periodic API availability check (every <span id="hb-interval">4</span>h)
+        </span>
+    </div>
+    <div class="table-wrapper">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Checked</th>
+                    <th>Status</th>
+                    <th>VM</th>
+                    <th>CSAM</th>
+                    <th>Duration</th>
+                    <th>Errors</th>
+                </tr>
+            </thead>
+            <tbody id="health-log-body">
+                <tr><td colspan="6" style="color:var(--text-muted);padding:20px;text-align:center;">Loading…</td></tr>
             </tbody>
         </table>
     </div>
@@ -137,5 +184,82 @@ async function loadRefreshLog() {
 }
 
 loadRefreshLog();
+
+// ── Ingestion Statistics card ────────────────────────────────
+function _friendlyAge(iso) {
+    if (!iso) return 'never';
+    const ts = new Date(iso);
+    const secs = Math.floor((Date.now() - ts.getTime()) / 1000);
+    if (secs < 60) return secs + 's ago';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+    if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+    return Math.floor(secs / 86400) + 'd ago';
+}
+
+async function loadIngestionStats() {
+    try {
+        const d = await fetchApi('/api/ingestion-stats');
+        document.getElementById('ig-csam').textContent = (d.csam_assets_count || 0).toLocaleString();
+        document.getElementById('ig-hosts').textContent = (d.vm_hosts_count || 0).toLocaleString();
+        document.getElementById('ig-dets').textContent = (d.vm_detections_count || 0).toLocaleString();
+        document.getElementById('ig-csam-ts').textContent = d.csam_assets_latest ? _friendlyAge(d.csam_assets_latest) : 'no snapshot yet';
+        document.getElementById('ig-hosts-ts').textContent = d.vm_hosts_latest ? _friendlyAge(d.vm_hosts_latest) : 'no snapshot yet';
+        document.getElementById('ig-dets-ts').textContent = d.vm_detections_latest ? _friendlyAge(d.vm_detections_latest) : 'no snapshot yet';
+
+        const h = d.refresh_history || {};
+        document.getElementById('ig-refreshes').textContent = (h.total || 0).toLocaleString();
+        document.getElementById('ig-refreshes-detail').textContent =
+            `${h.success || 0} success · ${h.partial || 0} partial · ${h.failed || 0} failed`;
+
+        document.getElementById('ig-rate').textContent =
+            h.success_rate_pct != null ? h.success_rate_pct + '%' : '—';
+        document.getElementById('ig-duration').textContent =
+            d.avg_duration_minutes ? d.avg_duration_minutes + ' min' : '—';
+        document.getElementById('ig-last').textContent =
+            d.last_success ? _friendlyAge(d.last_success) : 'never';
+        document.getElementById('ig-last-detail').textContent =
+            d.last_success ? d.last_success.slice(0, 16).replace('T', ' ') : 'no successful refresh yet';
+        document.getElementById('ig-size').textContent =
+            (d.db_size_mb || 0) + ' MB';
+    } catch (e) {
+        console.error('Ingestion stats load failed:', e);
+    }
+}
+
+// ── Recent Heartbeats card ───────────────────────────────────
+async function loadHealthLog() {
+    try {
+        const data = await fetchApi('/api/health-log?limit=20');
+        const tbody = document.getElementById('health-log-body');
+        if (!data || !data.length) {
+            tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);padding:20px;text-align:center;">No heartbeats recorded yet — first one fires within 30s of app startup.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = data.map(r => {
+            const ok = r.vm_available && r.csam_available;
+            const cls = ok ? 'badge-low' : 'badge-critical';
+            const status = ok ? 'OK' : 'DEGRADED';
+            const errs = [];
+            if (r.vm_error) errs.push('VM: ' + r.vm_error.slice(0, 80));
+            if (r.csam_error) errs.push('CSAM: ' + r.csam_error.slice(0, 80));
+            return `<tr>
+                <td>${(r.checked_at || '').slice(0, 16).replace('T', ' ')}</td>
+                <td><span class="badge ${cls}">${status}</span></td>
+                <td>${r.vm_available ? '&#10003;' : '&#10007;'}</td>
+                <td>${r.csam_available ? '&#10003;' : '&#10007;'}</td>
+                <td>${r.duration_ms != null ? r.duration_ms + 'ms' : '—'}</td>
+                <td style="font-size:12px;color:var(--text-muted);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${errs.join('\n').replace(/"/g,'&quot;')}">${errs.join(' · ') || '—'}</td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        console.error('Health log load failed:', e);
+    }
+}
+
+loadIngestionStats();
+loadHealthLog();
+// Refresh both cards every 30s so an in-flight refresh (or new heartbeat)
+// shows up without manual reload.
+setInterval(() => { loadIngestionStats(); loadHealthLog(); }, 30000);
 </script>
 {% endblock %}

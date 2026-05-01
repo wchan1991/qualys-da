@@ -355,6 +355,35 @@ a.metric-card:hover { border-color: var(--accent); transform: translateY(-1px); 
 }
 .status-dot.connected { background: var(--success); }
 .status-dot.disconnected { background: var(--danger); }
+/* Newer state classes used by the heartbeat-driven connection-dot. */
+.status-dot.status-ok { background: var(--success); }
+.status-dot.status-warn { background: var(--warning, #f0ad4e); }
+.status-dot.status-error { background: var(--danger); }
+.status-dot.status-pending { background: var(--text-muted); }
+
+/* Always-visible asset-count chip in the nav. Reads
+   /api/ingestion-stats and shows compact "85k · 9.5k · 62k" counts. */
+.asset-counter {
+    font-family: "Fira Code", "Consolas", monospace;
+    font-size: 12px;
+    color: var(--text-muted);
+    background: var(--bg-secondary, transparent);
+    padding: 3px 8px;
+    border-radius: var(--radius, 4px);
+    border: 1px solid var(--border-color, transparent);
+    text-decoration: none;
+    white-space: nowrap;
+    transition: color 0.15s, border-color 0.15s;
+    cursor: pointer;
+}
+.asset-counter:hover {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+}
+.asset-counter-empty {
+    opacity: 0.5;
+    font-style: italic;
+}
 
 /* SQL editor */
 .sql-editor {

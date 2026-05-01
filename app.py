@@ -13,9 +13,10 @@ connections, making it safe with Flask's threaded mode.
 import io
 import csv
 import sys
+import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from functools import wraps
 
@@ -129,6 +130,25 @@ def init_scheduler():
             id='weekly_refresh',
             name='Weekly data refresh'
         )
+        # Register the API availability heartbeat (default: every 4h).
+        # Reuses the same scheduler instance so start/stop lifecycle is
+        # shared. First run fires 30s after startup so the connection-dot
+        # has data to read on the very first page load (rather than
+        # waiting up to 4h for a heartbeat).
+        if config.health_check_enabled:
+            interval_h = max(1, int(config.health_check_interval_hours))
+            _scheduler.add_job(
+                scheduled_health_check,
+                'interval',
+                hours=interval_h,
+                id='health_heartbeat',
+                name='Qualys API availability heartbeat',
+                next_run_time=datetime.now() + timedelta(seconds=30),
+            )
+            logger.info(
+                f"Scheduler: registered health_heartbeat "
+                f"(interval: {interval_h}h, first run in 30s)"
+            )
         _scheduler.start()
         logger.info(f"Scheduler started: refresh every {config.refresh_day} at {config.refresh_hour:02d}:00")
     except ImportError:
@@ -146,6 +166,45 @@ def scheduled_refresh():
         logger.info(f"Scheduled refresh complete: {result}")
     except Exception as e:
         logger.error(f"Scheduled refresh failed: {e}", exc_info=True)
+
+
+def scheduled_health_check():
+    """Periodic API availability heartbeat — default cadence: every 4 hours.
+
+    Calls `manager.health_check()` (which itself just runs the cached-token
+    auth probes for VM and CSAM) and records the outcome in `health_log`.
+    The connection-dot in the nav bar reads from `health_log` so operators
+    see availability problems within minutes rather than waiting until the
+    next weekly refresh.
+
+    Designed to be cheap: each run makes at most 2 auth calls (one VM,
+    one CSAM), and only when the cached tokens have expired (~4h cycles).
+    """
+    logger.debug("Heartbeat firing...")
+    try:
+        manager = get_manager()
+        start = time.monotonic()
+        result = manager.health_check()
+        duration_ms = int((time.monotonic() - start) * 1000)
+        manager.db.log_health_check(
+            vm_available=bool(result.get("vm")),
+            csam_available=bool(result.get("csam")),
+            vm_error=result.get("vm_error"),
+            csam_error=result.get("csam_error"),
+            duration_ms=duration_ms,
+        )
+        if not result.get("vm") or not result.get("csam"):
+            logger.warning(
+                f"Heartbeat: VM={result.get('vm')} CSAM={result.get('csam')} "
+                f"(vm_err={result.get('vm_error')}, "
+                f"csam_err={result.get('csam_error')})"
+            )
+        else:
+            logger.info(f"Heartbeat OK ({duration_ms}ms)")
+    except Exception as e:
+        # Heartbeat failures must NEVER crash the scheduler — log loudly
+        # and let the next interval try again.
+        logger.error(f"Health heartbeat raised: {e}", exc_info=True)
 
 
 # ============================================================
@@ -886,6 +945,88 @@ def api_refresh_status():
 
 
 # ============================================================
+# API: Health Heartbeat + Ingestion Visibility
+# ============================================================
+#
+# These three endpoints power the always-visible operator surface:
+#   /api/health-status   — connection-dot reads this (cached, fast)
+#   /api/health-log      — Settings page "Recent Heartbeats" card
+#   /api/ingestion-stats — navbar asset-count chip + Settings KPI card
+#
+# /api/health (live probe) is preserved unchanged for the Settings page's
+# manual "Test connection" button, so operators retain the on-demand
+# debugging path when the cached data isn't enough.
+
+@app.route("/api/health-status")
+@api_response
+def api_health_status():
+    """Most recent heartbeat result — drives the connection dot.
+
+    Cheap (single indexed DB read), unlike /api/health which probes Qualys
+    live on every page nav. Returns:
+      vm/csam: bool or None (None means "no heartbeat yet")
+      vm_error/csam_error: str or None (last error if API was down)
+      checked_at: ISO timestamp of the heartbeat row
+      age_seconds: how old the latest heartbeat is
+      stale: True if older than 1.25 × interval — signals scheduler-died
+             vs. just-haven't-checked-yet
+    """
+    manager = get_manager()
+    row = manager.db.get_latest_health_check()
+    if not row:
+        return {"vm": None, "csam": None, "checked_at": None,
+                "age_seconds": None, "stale": True,
+                "vm_error": None, "csam_error": None}
+    try:
+        checked = datetime.fromisoformat(row["checked_at"])
+        age = int((datetime.utcnow() - checked).total_seconds())
+    except (ValueError, TypeError):
+        age = None
+    interval_s = max(1, int(manager.config.health_check_interval_hours)) * 3600
+    return {
+        "vm": bool(row["vm_available"]),
+        "csam": bool(row["csam_available"]),
+        "vm_error": row["vm_error"],
+        "csam_error": row["csam_error"],
+        "checked_at": row["checked_at"],
+        "age_seconds": age,
+        # 1.25x buffer: a heartbeat at minute 239 of a 240-minute interval
+        # shouldn't be flagged stale just because the next one hasn't fired.
+        "stale": age is not None and age > int(interval_s * 1.25),
+    }
+
+
+@app.route("/api/health-log")
+@api_response
+def api_health_log():
+    """Heartbeat history — Settings page "Recent Heartbeats" card."""
+    limit = max(1, min(500, request.args.get("limit", 20, type=int)))
+    return get_manager().db.get_health_log(limit)
+
+
+@app.route("/api/ingestion-stats")
+@api_response
+def api_ingestion_stats():
+    """Aggregate stats for the ingestion-visibility surface.
+
+    Drives:
+      - The navbar asset-counter chip (compact CSAM/Hosts/Detections counts)
+      - The Settings page Ingestion Statistics card
+      - The startup log banner (via the same db helper, called from __main__)
+    """
+    db = get_manager().db
+    stats = db.get_ingestion_stats()
+    # Add success-rate derivation here (rather than in the DB helper) so the
+    # core helper stays a pure rollup the startup banner can also consume.
+    h = stats["refresh_history"]
+    terminal = h["success"] + h["partial"] + h["failed"]
+    stats["refresh_history"]["success_rate_pct"] = (
+        round(100.0 * h["success"] / terminal, 1) if terminal > 0 else None
+    )
+    return stats
+
+
+# ============================================================
 # DATA EXPLORER
 # ============================================================
 
@@ -931,7 +1072,8 @@ def api_data_explorer_snapshots():
 
 
 EXPLORER_TABLES = {
-    "csam_assets", "vm_hosts", "vm_detections", "host_tags", "detection_changes",
+    "csam_assets", "vm_hosts", "vm_detections", "host_tags",
+    "detection_changes", "health_log",
 }
 
 EXPLORER_SEARCH_COLS = {
@@ -940,6 +1082,10 @@ EXPLORER_SEARCH_COLS = {
     "vm_detections": ["ip_address", "qid", "cve_id", "title", "status"],
     "host_tags": ["ip_address", "tag_name", "source"],
     "detection_changes": ["ip_address", "qid", "change_type"],
+    # health_log doesn't have an IP/host search axis; the only useful
+    # filter is the error-string substring (e.g. find every "AuthError"
+    # heartbeat over the last month).
+    "health_log": ["vm_error", "csam_error"],
 }
 
 
@@ -1096,6 +1242,105 @@ def _lan_ip() -> str:
         s.close()
 
 
+def _friendly_age(iso_ts: str) -> str:
+    """Format an ISO timestamp as 'N units ago' for human-readable banners.
+
+    Used by the startup banner and (mirrored in JS) by the navbar tooltip
+    so an operator can read freshness at a glance without parsing dates.
+    """
+    if not iso_ts:
+        return "never"
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+    except (ValueError, TypeError):
+        return "unknown"
+    delta = datetime.utcnow() - ts
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def _log_startup_banner():
+    """Emit a multi-line snapshot of the current DB state at startup.
+
+    Powers the "look under the hood" operator UX — see plan section 7a.
+    Mirrors what the navbar asset-counter chip shows, but in a richer
+    log-friendly format for terminal-watchers and `tail -f logs/app.log`.
+    """
+    try:
+        stats = get_manager().db.get_ingestion_stats()
+    except Exception as e:
+        logger.warning(f"Startup banner failed to read DB stats: {e}")
+        return
+
+    history = stats["refresh_history"]
+    is_empty = (
+        stats["csam_assets_count"] == 0
+        and stats["vm_hosts_count"] == 0
+        and stats["vm_detections_count"] == 0
+        and history["total"] == 0
+    )
+
+    logger.info("=" * 60)
+    logger.info("Database state at startup")
+    if is_empty:
+        logger.info(
+            "  Database is empty. Run 'python cli.py refresh' "
+            "or click Refresh All to ingest from Qualys."
+        )
+    else:
+        def fmt_snap(table_label, count_key, latest_key):
+            count = stats.get(count_key, 0)
+            latest = stats.get(latest_key)
+            age = f", {_friendly_age(latest)}" if latest else ""
+            return (
+                f"  {table_label:<18} {count:>9,}"
+                + (f"  (latest snapshot: {latest}{age})" if latest else "")
+            )
+
+        logger.info(fmt_snap("CSAM assets:", "csam_assets_count", "csam_assets_latest"))
+        logger.info(fmt_snap("VM hosts:", "vm_hosts_count", "vm_hosts_latest"))
+        logger.info(fmt_snap("VM detections:", "vm_detections_count", "vm_detections_latest"))
+        logger.info(fmt_snap("Host tags:", "host_tags_count", "host_tags_latest"))
+        logger.info(
+            f"  {'Detection changes:':<18} "
+            f"{stats.get('detection_changes_30d', 0):>9,}  (cumulative, last 30d)"
+        )
+        logger.info(
+            f"  {'Refresh history:':<18} "
+            f"{history['total']:>9,} runs · "
+            f"{history['success']} success · "
+            f"{history['partial']} partial · "
+            f"{history['failed']} failed"
+        )
+        last_ok = stats.get("last_success")
+        if last_ok:
+            logger.info(
+                f"  {'Last successful:':<18} {last_ok}  ({_friendly_age(last_ok)})"
+            )
+        else:
+            logger.info(f"  {'Last successful:':<18} never")
+        hb = stats.get("heartbeats", {})
+        hb_latest = hb.get("latest") or {}
+        if hb_latest:
+            hb_status = "OK" if (
+                hb_latest.get("vm_available") and hb_latest.get("csam_available")
+            ) else "DEGRADED"
+            logger.info(
+                f"  {'Heartbeats:':<18} {hb.get('total', 0):>9,} rows · "
+                f"last check: {_friendly_age(hb_latest.get('checked_at'))} ({hb_status})"
+            )
+        else:
+            logger.info(f"  {'Heartbeats:':<18}         0 rows · awaiting first check")
+        logger.info(f"  {'DB file size:':<18} {stats.get('db_size_mb', 0):>9.1f} MB")
+    logger.info("=" * 60)
+
+
 def _parse_cli_args(argv):
     """Parse server host/port flags. Returns (host_override, port_override, public)."""
     import argparse
@@ -1144,6 +1389,13 @@ if __name__ == "__main__":
     # Pre-initialize manager to create tables
     get_manager()
     logger.info("Database initialized")
+
+    # ── "Look under the hood" startup banner ─────────────────────
+    # Surfaces what's already in the DB the moment the app boots so the
+    # operator can immediately see asset counts, refresh history, and
+    # heartbeat status without navigating to /data-explorer or running
+    # a SQL query. Mirrored by the navbar asset-count chip in the UI.
+    _log_startup_banner()
 
     # Print reachable URL(s) so the user knows exactly where to point a browser.
     if host in ("0.0.0.0", "::"):

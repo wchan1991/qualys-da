@@ -94,6 +94,13 @@ severity_1 = 365
 enabled = true
 refresh_day = monday
 refresh_hour = 6
+# Periodic API availability heartbeat. Calls health_check() every N hours
+# and records the result in health_log. The connection-dot in the nav bar
+# reads from this so operators see availability problems within minutes
+# rather than waiting until the next weekly refresh. Disable if Qualys
+# rate limits are tight and you'd rather save the ~2 calls per heartbeat.
+health_check_enabled = true
+health_check_interval_hours = 4
 
 [server]
 # Flask bind address and port.

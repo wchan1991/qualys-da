@@ -80,6 +80,15 @@ class QualysDAConfig:
     scheduler_enabled: bool = True
     refresh_day: str = "monday"
     refresh_hour: int = 6
+    health_check_enabled: bool = True   # Periodic API availability heartbeat —
+                                        # exercises health_check() and writes
+                                        # to health_log so the connection-dot
+                                        # reflects current platform status
+                                        # without making a live auth call on
+                                        # every page load.
+    health_check_interval_hours: int = 4  # Default 4h aligns with the auth
+                                          # token cache lifetime in
+                                          # _vm_authenticate / _csam_authenticate.
 
     # Server (Flask bind host + port)
     server_host: str = "localhost"
@@ -227,6 +236,10 @@ def load_config(config_path: Optional[Path] = None) -> QualysDAConfig:
         scheduler_enabled=get_bool("scheduler", "enabled", True),
         refresh_day=get_str("scheduler", "refresh_day", "monday"),
         refresh_hour=get_int("scheduler", "refresh_hour", 6),
+        health_check_enabled=get_bool("scheduler", "health_check_enabled", True),
+        health_check_interval_hours=get_int(
+            "scheduler", "health_check_interval_hours", 4
+        ),
         server_host=get_str("server", "host", "localhost"),
         server_port=get_int("server", "port", 5001),
         log_level=get_str("logging", "level", "INFO"),

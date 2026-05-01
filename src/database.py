@@ -363,6 +363,25 @@ class QualysDADatabase:
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # ── Health Log ───────────────────────────────────────────
+        # Periodic API availability heartbeat. Populated by the
+        # `scheduled_health_check` job (default cadence: every 4 hours)
+        # in `app.py`. Each row records the outcome of one
+        # `client.health_check()` call so the connection-dot in the nav
+        # bar can show platform availability without making a fresh
+        # auth call on every page load. See BACKLOG.md.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS health_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                checked_at TEXT NOT NULL,
+                vm_available INTEGER NOT NULL,
+                csam_available INTEGER NOT NULL,
+                vm_error TEXT,
+                csam_error TEXT,
+                duration_ms INTEGER
+            )
+        """)
+
         # ── Indexes ──────────────────────────────────────────────
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_csam_ip ON csam_assets(ip_address)",
@@ -393,6 +412,7 @@ class QualysDADatabase:
             "CREATE INDEX IF NOT EXISTS idx_weekly_start ON weekly_rollups(week_start)",
             "CREATE INDEX IF NOT EXISTS idx_monthly_start ON monthly_rollups(month_start)",
             "CREATE INDEX IF NOT EXISTS idx_owners_type ON asset_owners(match_type, match_value)",
+            "CREATE INDEX IF NOT EXISTS idx_health_checked_at ON health_log(checked_at DESC)",
         ]
         for idx in indexes:
             cursor.execute(idx)
@@ -1264,7 +1284,13 @@ class QualysDADatabase:
     # ── Retention / Purge ────────────────────────────────────────
 
     def purge_daily_snapshots(self, days: int = 30) -> Dict[str, int]:
-        """Delete snapshot rows older than N days, keeping weekly/monthly preserved ones."""
+        """Delete snapshot rows older than N days, keeping weekly/monthly preserved ones.
+
+        Also prunes `health_log` to the same cutoff — it's not a snapshot
+        table but at one heartbeat every 4 hours we'd accumulate ~2,200
+        rows per year if left untouched. Same retention horizon keeps
+        the operator's mental model simple.
+        """
         from datetime import timedelta
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
         counts = {}
@@ -1273,6 +1299,11 @@ class QualysDADatabase:
                 f"DELETE FROM {table} WHERE fetched_at < ?", (cutoff,)
             )
             counts[table] = cursor.rowcount
+        # Heartbeat log uses checked_at, not fetched_at — separate clause.
+        cursor = self.conn.execute(
+            "DELETE FROM health_log WHERE checked_at < ?", (cutoff,)
+        )
+        counts["health_log"] = cursor.rowcount
         self.conn.commit()
         logger.info(f"Purged daily snapshots older than {days}d: {counts}")
         return counts
@@ -1292,6 +1323,122 @@ class QualysDADatabase:
             "SELECT * FROM refresh_log ORDER BY started_at DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Health Log ───────────────────────────────────────────────
+    #
+    # The heartbeat job (`scheduled_health_check` in `app.py`) writes one
+    # row per ping. The connection-dot in the nav bar reads
+    # `get_latest_health_check()` so page loads don't trigger a fresh
+    # auth call to Qualys — just a single indexed DB read.
+
+    def log_health_check(self, vm_available: bool, csam_available: bool,
+                         vm_error: Optional[str] = None,
+                         csam_error: Optional[str] = None,
+                         duration_ms: Optional[int] = None) -> int:
+        """Insert one heartbeat row. Returns the new row's id."""
+        cursor = self.conn.execute(
+            """INSERT INTO health_log
+               (checked_at, vm_available, csam_available,
+                vm_error, csam_error, duration_ms)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (datetime.utcnow().isoformat(),
+             1 if vm_available else 0,
+             1 if csam_available else 0,
+             vm_error, csam_error, duration_ms),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_latest_health_check(self) -> Optional[Dict]:
+        """Most recent heartbeat row, or None if no heartbeats have run yet."""
+        row = self.conn.execute(
+            "SELECT * FROM health_log ORDER BY checked_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_health_log(self, limit: int = 50) -> List[Dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM health_log ORDER BY checked_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Ingestion Visibility ─────────────────────────────────────
+    #
+    # One-shot rollup powering the startup log banner, the navbar
+    # asset-count chip, and the Settings page "Ingestion Statistics"
+    # card. Aggregates current snapshot counts (latest fetched_at per
+    # table), refresh-log lifetime aggregates, heartbeat aggregates,
+    # and DB file size.
+    #
+    # Cheap by design: snapshot counts are filtered to the latest
+    # fetched_at (uses the existing idx_*_fetched indexes), and the
+    # refresh-history aggregate is a single GROUP BY over a small
+    # table. Should consistently land sub-50ms even on big DBs.
+
+    def get_ingestion_stats(self) -> Dict[str, Any]:
+        """Aggregate stats for the ingestion-visibility surface area."""
+        out: Dict[str, Any] = {}
+        # Current snapshot counts (latest fetched_at per table)
+        for table in ("csam_assets", "vm_hosts", "vm_detections", "host_tags"):
+            latest = self.get_latest_fetched_at(table)
+            if latest:
+                row = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE fetched_at = ?",
+                    (latest,),
+                ).fetchone()
+                out[f"{table}_count"] = row[0] if row else 0
+                out[f"{table}_latest"] = latest
+            else:
+                out[f"{table}_count"] = 0
+                out[f"{table}_latest"] = None
+        # detection_changes is cumulative (no fetched_at) — bound to
+        # last 30 days so the number stays meaningful as the table grows.
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM detection_changes "
+            "WHERE detected_at >= date('now', '-30 days')"
+        ).fetchone()
+        out["detection_changes_30d"] = row[0] if row else 0
+        # Refresh history aggregates
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM refresh_log GROUP BY status"
+        ).fetchall()
+        history = {"total": 0, "success": 0, "partial": 0,
+                   "failed": 0, "running": 0}
+        for r in rows:
+            history[r["status"]] = r["cnt"]
+            history["total"] += r["cnt"]
+        out["refresh_history"] = history
+        # Last successful refresh
+        last_ok = self.conn.execute(
+            """SELECT completed_at FROM refresh_log
+               WHERE status = 'success' AND completed_at IS NOT NULL
+               ORDER BY completed_at DESC LIMIT 1"""
+        ).fetchone()
+        out["last_success"] = last_ok["completed_at"] if last_ok else None
+        # Average refresh duration (success rows only, in minutes)
+        avg = self.conn.execute(
+            """SELECT AVG((julianday(completed_at) - julianday(started_at)) * 1440) AS minutes
+               FROM refresh_log WHERE status='success' AND completed_at IS NOT NULL"""
+        ).fetchone()
+        out["avg_duration_minutes"] = round(avg["minutes"] or 0, 1)
+        # Heartbeat summary
+        hb_total = self.conn.execute(
+            "SELECT COUNT(*) FROM health_log"
+        ).fetchone()[0]
+        hb_latest = self.get_latest_health_check()
+        out["heartbeats"] = {
+            "total": hb_total,
+            "latest": hb_latest,
+        }
+        # DB file size
+        if self.db_path.exists():
+            out["db_size_mb"] = round(
+                self.db_path.stat().st_size / (1024 * 1024), 2
+            )
+        else:
+            out["db_size_mb"] = 0.0
+        return out
 
     def get_db_stats(self) -> Dict[str, Any]:
         stats = {}

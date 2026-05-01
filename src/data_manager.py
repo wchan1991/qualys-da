@@ -269,9 +269,33 @@ class DataManager:
                     "vm_detections": "skipped"}
         errors: Dict[str, str] = {}
 
+        # ── "Look under the hood" delta logging ──────────────────
+        # Snapshot the DB state before the pull so we can log the
+        # actual row-count deltas at the end. This is a separate
+        # signal from the API-fetch counts in `refresh_log` — those
+        # tell you what came down the wire; these tell you what
+        # actually landed in the DB after dedup / replace logic.
+        # `refresh_num` is the human-friendly sequence number visible
+        # in `tail -f logs/app.log | grep "Refresh #"`.
+        try:
+            before_stats = self.db.get_ingestion_stats()
+            refresh_num = before_stats["refresh_history"]["total"]  # this run included
+        except Exception as e:
+            logger.debug(f"Could not snapshot pre-refresh stats: {e}")
+            before_stats = None
+            refresh_num = None
+
         try:
             logger.info("=" * 60)
-            logger.info("Starting full refresh")
+            if refresh_num is not None and before_stats is not None:
+                logger.info(
+                    f"Refresh #{refresh_num} starting (before: "
+                    f"CSAM {before_stats['csam_assets_count']:,} · "
+                    f"Hosts {before_stats['vm_hosts_count']:,} · "
+                    f"Detections {before_stats['vm_detections_count']:,})"
+                )
+            else:
+                logger.info("Starting full refresh")
             logger.info("=" * 60)
 
             # ── 1. Preflight auth: fail fast on bad creds ────────────
@@ -521,6 +545,27 @@ class DataManager:
                 f"Refresh complete: status={row_status} outcomes={outcomes} "
                 f"counts={counts}"
             )
+            # ── "Look under the hood" delta log ──────────────────
+            # Counts are read after invalidate_cache so they reflect
+            # post-pull DB state. Signed deltas tell the operator what
+            # actually changed (new assets, retired hosts, dedup-replaced
+            # detections). Counts here are DB row counts, not API
+            # fetch counts — the latter live in refresh_log.
+            if before_stats is not None and refresh_num is not None:
+                try:
+                    after = self.db.get_ingestion_stats()
+                    csam_d = after['csam_assets_count'] - before_stats['csam_assets_count']
+                    host_d = after['vm_hosts_count'] - before_stats['vm_hosts_count']
+                    det_d = after['vm_detections_count'] - before_stats['vm_detections_count']
+                    logger.info(
+                        f"Refresh #{refresh_num} complete (after: "
+                        f"CSAM {after['csam_assets_count']:,} · "
+                        f"Hosts {after['vm_hosts_count']:,} · "
+                        f"Detections {after['vm_detections_count']:,} "
+                        f"— Δ {csam_d:+,} / {host_d:+,} / {det_d:+,})"
+                    )
+                except Exception as e:
+                    logger.debug(f"Post-refresh stats snapshot failed: {e}")
 
         except AuthError:
             # Already logged + marked failed above; don't double-log.

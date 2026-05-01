@@ -64,22 +64,136 @@ function showToast(message, type = 'info') {
 }
 
 // ── Connection Status ────────────────────────────────────────
+//
+// The dot reads /api/health-status (a single DB read of the latest
+// `health_log` row written by the in-process heartbeat job, default 4h
+// cadence). We deliberately do NOT hit /api/health on every page load —
+// that would trigger a fresh Qualys auth call every navigation, burning
+// tokens and quota on a tenant with tight rate limits.
+//
+// Colour scheme:
+//   green  — both VM + CSAM up, heartbeat fresh
+//   amber  — heartbeat is stale (scheduler may have died)
+//   red    — either API was down on the latest heartbeat
+//   grey   — no heartbeat yet (first 30s after app start)
+//
+// Toasts fire on transitions so an operator already on the page sees
+// failures even if they don't notice the dot colour change.
+
+let _lastHealthState = null;  // 'ok' | 'fail' | 'stale' | 'pending'
+let _lastHealthAnnouncedFail = false;  // dedup repeat-failure toasts
+
+function _humanAge(seconds) {
+    if (seconds == null) return 'never';
+    if (seconds < 60) return seconds + 's ago';
+    if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+    if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
+    return Math.floor(seconds / 86400) + 'd ago';
+}
+
 async function checkConnection() {
     const dot = document.getElementById('connection-dot');
     if (!dot) return;
     try {
-        const resp = await fetch('/api/health', { method: 'GET' });
-        dot.className = 'status-dot ' + (resp.ok ? 'status-ok' : 'status-warn');
-        dot.title = resp.ok ? 'Connected' : 'API issues';
-    } catch {
+        const resp = await fetch('/api/health-status', { method: 'GET' });
+        if (!resp.ok) {
+            dot.className = 'status-dot status-error';
+            dot.title = `Heartbeat endpoint returned ${resp.status}`;
+            return;
+        }
+        const data = await resp.json();
+
+        let state, klass, tooltip;
+        if (data.checked_at == null) {
+            state = 'pending';
+            klass = 'status-pending';
+            tooltip = 'Awaiting first heartbeat...';
+        } else if (data.vm === false || data.csam === false) {
+            state = 'fail';
+            klass = 'status-error';
+            const parts = [`Last checked: ${_humanAge(data.age_seconds)}`];
+            parts.push(`VM ${data.vm ? '✓' : '✗'}`);
+            parts.push(`CSAM ${data.csam ? '✓' : '✗'}`);
+            const errs = [];
+            if (data.vm_error) errs.push(`VM: ${data.vm_error.slice(0, 80)}`);
+            if (data.csam_error) errs.push(`CSAM: ${data.csam_error.slice(0, 80)}`);
+            tooltip = parts.join(' · ') + (errs.length ? '\n' + errs.join('\n') : '');
+        } else if (data.stale) {
+            state = 'stale';
+            klass = 'status-warn';
+            tooltip = `Heartbeat stale — last checked ${_humanAge(data.age_seconds)}.\nScheduler may have stopped firing.`;
+        } else {
+            state = 'ok';
+            klass = 'status-ok';
+            tooltip = `Last checked: ${_humanAge(data.age_seconds)} — VM ✓, CSAM ✓`;
+        }
+        dot.className = 'status-dot ' + klass;
+        dot.title = tooltip;
+
+        // Toast on transitions only — not on every poll.
+        if (state === 'fail' && !_lastHealthAnnouncedFail) {
+            const which = !data.vm ? 'VM' : 'CSAM';
+            const errMsg = (data.vm_error || data.csam_error || '').slice(0, 120);
+            showToast(`Qualys ${which} unreachable — ${errMsg}`, 'error');
+            _lastHealthAnnouncedFail = true;
+        } else if (state === 'ok' && _lastHealthAnnouncedFail) {
+            showToast('Qualys connectivity restored', 'success');
+            _lastHealthAnnouncedFail = false;
+        }
+        _lastHealthState = state;
+    } catch (e) {
         dot.className = 'status-dot status-error';
-        dot.title = 'Disconnected';
+        dot.title = 'Cannot reach app: ' + e.message;
     }
 }
 
-// Check connection on load, then every 60 seconds
-checkConnection();
-setInterval(checkConnection, 60000);
+// ── Asset-Count Chip ─────────────────────────────────────────
+//
+// Always-visible "look under the hood" indicator showing CSAM / VM Hosts /
+// VM Detections row counts (compact format: "85k · 9.5k · 62k"). Hover for
+// full numbers + last-refresh age. Click to open Data Explorer. Folded into
+// the same 60s poller as the connection dot to avoid a second timer.
+
+function _fmtCompact(n) {
+    if (n == null) return '0';
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 10000) return Math.floor(n / 1000) + 'k';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+    return String(n);
+}
+
+async function loadAssetCounter() {
+    const el = document.getElementById('asset-counter');
+    if (!el) return;
+    try {
+        const resp = await fetch('/api/ingestion-stats');
+        if (!resp.ok) return;
+        const d = await resp.json();
+        const csam = d.csam_assets_count || 0;
+        const hosts = d.vm_hosts_count || 0;
+        const dets = d.vm_detections_count || 0;
+        el.textContent = `${_fmtCompact(csam)} · ${_fmtCompact(hosts)} · ${_fmtCompact(dets)}`;
+        const isEmpty = (csam + hosts + dets) === 0;
+        el.classList.toggle('asset-counter-empty', isEmpty);
+        const tooltip = [
+            `CSAM ${csam.toLocaleString()} · Hosts ${hosts.toLocaleString()} · Detections ${dets.toLocaleString()}`,
+            d.last_success ? `Last successful refresh: ${d.last_success}` : 'No successful refresh yet',
+            'Click to open Data Explorer',
+        ].join('\n');
+        el.title = tooltip;
+    } catch (e) {
+        // Non-fatal — leave the chip alone if the endpoint is down.
+    }
+}
+
+function _heartbeatTick() {
+    checkConnection();
+    loadAssetCounter();
+}
+
+// Initial render + 60s poll cycle for both the dot and the chip.
+_heartbeatTick();
+setInterval(_heartbeatTick, 60000);
 
 // ── Refresh-in-progress Banner ───────────────────────────────
 // Polls /api/refresh-status every 3s. When a pull is running, shows

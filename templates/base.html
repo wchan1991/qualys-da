@@ -48,6 +48,10 @@
         </div>
         <div class="nav-actions">
             <button id="theme-toggle" class="btn btn-icon" title="Toggle theme" onclick="toggleTheme()">&#9789;</button>
+            <a id="asset-counter"
+               class="asset-counter"
+               href="{{ url_for('data_explorer_page') }}"
+               title="Loading asset counts...">&mdash;</a>
             <span id="connection-dot" class="status-dot" title="Checking..."></span>
         </div>
     </nav>

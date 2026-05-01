@@ -51,6 +51,7 @@
             <label class="pill"><input type="radio" name="explorer-table" value="vm_detections"> VM Detections</label>
             <label class="pill"><input type="radio" name="explorer-table" value="host_tags"> Host Tags</label>
             <label class="pill"><input type="radio" name="explorer-table" value="detection_changes"> Changes</label>
+            <label class="pill"><input type="radio" name="explorer-table" value="health_log"> Heartbeats</label>
         </div>
     </div>
 
@@ -207,6 +208,17 @@ const SCHEMA = {
             ['new_value', 'TEXT', 'New status or severity'],
             ['severity', 'INTEGER', 'Current severity'],
             ['detected_at', 'TEXT', 'When the diff was observed'],
+        ]
+    },
+    health_log: {
+        api: 'In-process heartbeat — exercises health_check() every N hours (default 4h) and records the outcome',
+        columns: [
+            ['checked_at', 'TEXT', 'Heartbeat timestamp (ISO 8601 UTC)'],
+            ['vm_available', 'INTEGER', '1 if VM auth succeeded on this check, 0 if it failed'],
+            ['csam_available', 'INTEGER', '1 if CSAM auth succeeded on this check, 0 if it failed'],
+            ['vm_error', 'TEXT', 'VM auth/connectivity error string (NULL if VM was OK)'],
+            ['csam_error', 'TEXT', 'CSAM auth/connectivity error string (NULL if CSAM was OK)'],
+            ['duration_ms', 'INTEGER', 'How long the heartbeat took to complete (in ms)'],
         ]
     },
 };
