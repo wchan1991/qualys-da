@@ -71,7 +71,13 @@ def _vm_detection(host_id, ip, qid):
 
 def _make_manager(db_path):
     """Build a DataManager with a mocked Qualys client and
-    parallel_refresh ON so refresh_all exercises the 3-way executor."""
+    parallel_refresh ON so refresh_all exercises the 3-way executor.
+
+    Count endpoints return None by default so the drift-detection logic
+    in `_classify_drift` is bypassed (no expected to compare against —
+    classified as success regardless of actual count). Tests that
+    specifically exercise drift detection should override these mocks
+    with explicit numeric returns; see test_csam_drift.py."""
     config = QualysDAConfig(
         db_path=db_path, username="test", password="test",
         csam_resume_enabled=True, csam_lookback_days=0,
@@ -81,10 +87,11 @@ def _make_manager(db_path):
     mgr._client = MagicMock(spec=QualysClient)
     # ensure_authenticated is a no-op in tests
     mgr._client.ensure_authenticated = MagicMock(return_value=None)
-    # Count endpoints return plausible numbers so refresh_log shows expected
-    mgr._client.count_csam_assets = MagicMock(return_value=4)
-    mgr._client.count_vm_hosts = MagicMock(return_value=2)
-    mgr._client.count_vm_detections = MagicMock(return_value=2)
+    # Count endpoints return None so drift detection is bypassed in
+    # tests that don't care about it. Drift-specific tests override.
+    mgr._client.count_csam_assets = MagicMock(return_value=None)
+    mgr._client.count_vm_hosts = MagicMock(return_value=None)
+    mgr._client.count_vm_detections = MagicMock(return_value=None)
     # Tag extraction helpers are @staticmethod on the real class — no need
     # to mock; they just walk the passed lists.
     return mgr

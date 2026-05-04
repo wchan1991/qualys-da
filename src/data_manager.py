@@ -26,6 +26,51 @@ from .analytics import AnalyticsEngine
 logger = logging.getLogger(__name__)
 
 
+def _classify_drift(actual: int, expected: Optional[int],
+                    api_label: str, *, tolerance: int = 0
+                    ) -> Tuple[str, Optional[str]]:
+    """Classify a fetch outcome by comparing actual rows to the count
+    endpoint's reported total.
+
+    Returns ``(status, error_msg)``:
+      - actual == expected (or within ``tolerance``)  → ``success, None``
+      - actual <  expected (outside tolerance)        → ``partial, msg``
+      - actual >  expected                            → ``success, None``
+        (positive drift = count endpoint was slightly stale; benign,
+         we got everything plus more)
+      - expected is None                              → ``success, None``
+        (no count to compare against — count endpoint failed earlier)
+
+    Used by `refresh_all`'s per-API workers so a clean pull that landed
+    short of the count-endpoint's total is surfaced as `partial` rather
+    than `success`. Without this, an operator who clicks "Refresh All"
+    on a 100k-asset fleet and gets back 95k under a successful refresh
+    has no UI signal that 5k are missing.
+    """
+    if expected is None:
+        return ("success", None)
+    drift = actual - expected
+    if abs(drift) <= tolerance:
+        return ("success", None)
+    if drift < 0:
+        msg = (
+            f"{api_label} fetched {actual:,} of {expected:,} "
+            f"reported by count endpoint (drift {drift:+,}) — "
+            f"snapshot incomplete, re-run to fill the gap"
+        )
+        logger.warning(msg)
+        return ("partial", msg)
+    # Positive drift: more rows than count endpoint reported. Almost
+    # always benign (count was a few seconds stale by the time the
+    # paginated pull finished). Log informationally but call it a
+    # success — we got everything we expected and then some.
+    logger.info(
+        f"{api_label} positive drift: fetched {actual:,} vs expected "
+        f"{expected:,} (+{drift:,}) — count endpoint was stale, success."
+    )
+    return ("success", None)
+
+
 class DataManager:
     """
     High-level coordinator for data operations.
@@ -450,9 +495,32 @@ class DataManager:
                     assets, snapshot = self._fetch_csam_with_checkpoint(
                         expected=csam_expected, refresh_id=refresh_id,
                     )
-                    return {"status": "success", "count": len(assets),
+                    # Drift check — does the actual snapshot row count
+                    # match what `count_csam_assets` reported in preflight?
+                    # Important to query the DB rather than `len(assets)`:
+                    # on a resumed pull, `assets` only contains the new
+                    # pages, while the DB has every page across all
+                    # resumed runs under the same `snapshot_fetched_at`.
+                    actual = len(assets)
+                    try:
+                        row = self.db.conn.execute(
+                            "SELECT COUNT(*) FROM csam_assets "
+                            "WHERE fetched_at = ?",
+                            (snapshot,),
+                        ).fetchone()
+                        if row and row[0] is not None:
+                            actual = int(row[0])
+                    except Exception as e:
+                        logger.debug(
+                            f"CSAM drift-count DB query failed, falling "
+                            f"back to len(assets)={len(assets)}: {e}"
+                        )
+                    status, drift_err = _classify_drift(
+                        actual, csam_expected, "CSAM",
+                    )
+                    return {"status": status, "count": actual,
                             "data": assets, "snapshot": snapshot,
-                            "error": None}
+                            "error": drift_err}
                 except CancelledError as e:
                     # Operator-requested stop — distinct from failure.
                     # CSAM saves per-page so already-fetched rows are
@@ -504,8 +572,14 @@ class DataManager:
                     hosts = self.client.fetch_vm_hosts(
                         expected=vm_host_expected, on_page=_hosts_on_page,
                     )
-                    return {"status": "success", "count": len(hosts),
-                            "data": hosts, "error": None}
+                    # Drift check vs count_vm_hosts() preflight. Unlike
+                    # CSAM there's no resume mechanism; len(hosts) is the
+                    # full set we just pulled.
+                    status, drift_err = _classify_drift(
+                        len(hosts), vm_host_expected, "VM hosts",
+                    )
+                    return {"status": status, "count": len(hosts),
+                            "data": hosts, "error": drift_err}
                 except CancelledError as e:
                     logger.info(f"VM hosts refresh cancelled: {e}")
                     return {"status": "cancelled", "count": 0, "data": None,
@@ -535,8 +609,12 @@ class DataManager:
                     dets = self.client.fetch_vm_detections(
                         expected=vm_det_expected, on_page=_dets_on_page,
                     )
-                    return {"status": "success", "count": len(dets),
-                            "data": dets, "error": None}
+                    # Drift check vs count_vm_detections() preflight.
+                    status, drift_err = _classify_drift(
+                        len(dets), vm_det_expected, "VM detections",
+                    )
+                    return {"status": status, "count": len(dets),
+                            "data": dets, "error": drift_err}
                 except CancelledError as e:
                     logger.info(f"VM detections refresh cancelled: {e}")
                     return {"status": "cancelled", "count": 0, "data": None,
