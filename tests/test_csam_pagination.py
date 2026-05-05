@@ -305,5 +305,99 @@ class CompletionLoggingTest(unittest.TestCase):
         self.assertIn("CSAM pull complete", joined)
 
 
+class PerPageDiagnosticLoggingTest(unittest.TestCase):
+    """Per-page logging that surfaces the data Qualys actually
+    returned. Added because operators were seeing "only 2 pages of
+    300" without enough log detail to diagnose what Qualys was
+    saying. See BACKLOG entry 2026-05-04."""
+
+    def test_each_page_logs_one_concise_info_line(self):
+        """Per-page INFO is the default-level breadcrumb so a 2-page
+        mystery pull is visible without flipping to DEBUG."""
+        client = _make_client()
+        client._csam_request = MagicMock(side_effect=[
+            _fake_response(
+                assets=[{"assetId": "a1"}], has_more=1, last_seen_id="a1",
+            ),
+            _fake_response(
+                assets=[{"assetId": "a2"}], has_more=0, last_seen_id="a2",
+            ),
+        ])
+        with self.assertLogs("src.api_client", level="INFO") as cm:
+            client.fetch_csam_assets()
+        page_lines = [m for m in cm.output if "CSAM page " in m and "assets," in m]
+        self.assertEqual(len(page_lines), 2,
+            f"Expected one per-page INFO line per call, got: {page_lines}")
+        # Format check: page 1 should mention hasMore=1, lastSeenAssetId=a1
+        self.assertIn("hasMore=1", page_lines[0])
+        self.assertIn("lastSeenAssetId=a1", page_lines[0])
+        # Page 2 should mention hasMore=0
+        self.assertIn("hasMore=0", page_lines[1])
+
+    def test_debug_log_includes_top_level_response_keys(self):
+        """DEBUG payload reveals the raw response shape — useful for
+        catching tenant-version differences (data vs assetListData,
+        hasMore vs hasMoreRecords) when a pull returns 0 assets."""
+        client = _make_client()
+        client._csam_request = MagicMock(side_effect=[
+            _fake_response(
+                assets=[{"assetId": "a1"}], has_more=0, last_seen_id="a1",
+            ),
+        ])
+        with self.assertLogs("src.api_client", level="DEBUG") as cm:
+            client.fetch_csam_assets()
+        debug_lines = [m for m in cm.output if "response: HTTP " in m]
+        self.assertTrue(debug_lines, "Per-page response DEBUG line missing")
+        # Should include the top-level response keys for shape diagnosis
+        self.assertIn("top_level_keys=", debug_lines[0])
+        self.assertIn("hasMoreRecords", debug_lines[0])
+
+    def test_suspicious_early_termination_warns(self):
+        """When Qualys says hasMore=0 after just a few pages but the
+        preflight count was much higher, log a WARNING with diagnostic
+        hints. This is exactly the "only ran 2 pages of 300, expected
+        250k+" scenario that prompted this work."""
+        client = _make_client()
+        client._csam_request = MagicMock(side_effect=[
+            _fake_response(
+                assets=[{"assetId": f"a{i}"} for i in range(300)],
+                has_more=1, last_seen_id="a299",
+            ),
+            _fake_response(
+                assets=[{"assetId": f"b{i}"} for i in range(300)],
+                has_more=0, last_seen_id="b299",
+            ),
+        ])
+        with self.assertLogs("src.api_client", level="WARNING") as cm:
+            client.fetch_csam_assets(expected=250_000)
+        warns = [m for m in cm.output
+                 if "terminated cleanly" in m and "suspicious" in m]
+        self.assertEqual(len(warns), 1,
+            f"Expected one suspicious-early-termination warning, got: {cm.output}")
+        # Useful diagnostic hints in the message
+        self.assertIn("csam_lookback_days", warns[0])
+        self.assertIn("DEBUG", warns[0])
+
+    def test_silent_clamping_logs_size_mismatch(self):
+        """If Qualys silently clamps the page size we asked for, the
+        per-page INFO line surfaces it (e.g. asked 300, got 100). This
+        is how the original 50k cap was discovered."""
+        client = _make_client()
+        # Asked for default 300, got 100 (clamped)
+        client._csam_request = MagicMock(side_effect=[
+            _fake_response(
+                assets=[{"assetId": f"a{i}"} for i in range(100)],
+                has_more=0, last_seen_id="a99",
+            ),
+        ])
+        with self.assertLogs("src.api_client", level="INFO") as cm:
+            client.fetch_csam_assets(page_size=300)
+        page_lines = [m for m in cm.output if "CSAM page 1" in m]
+        self.assertTrue(page_lines)
+        # The "(asked X, got Y)" suffix surfaces the clamp
+        self.assertIn("asked 300", page_lines[0])
+        self.assertIn("got 100", page_lines[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

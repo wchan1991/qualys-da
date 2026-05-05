@@ -1050,12 +1050,27 @@ class QualysClient:
                 # ServiceRequest level.
                 body["ServiceRequest"]["filter"] = filter_qql
 
+            # ── Per-call DEBUG: what we sent ────────────────────
+            #
+            # Logged at DEBUG so noisy 1000-page pulls don't flood
+            # logs/app.log by default, but operators chasing a
+            # short-pull mystery (e.g. "only 2 pages, why?") can flip
+            # log_level=DEBUG and see exactly what request went out.
+            prefs = body["ServiceRequest"]["preferences"]
+            logger.debug(
+                f"CSAM page {page} request: "
+                f"startFromId={prefs.get('startFromId')!r}, "
+                f"limitResults={prefs.get('limitResults')}, "
+                f"filter={body['ServiceRequest'].get('filter')!r}"
+            )
+            t0 = time.monotonic()
             response = self._csam_request(
                 "POST",
                 "/rest/2.0/search/am/asset",
                 json_body=body,
                 timeout=120,
             )
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
 
             # Defensive filter fallback: if Qualys rejects the filter with a
             # 4xx on the FIRST page only, drop it and retry. This guards
@@ -1128,6 +1143,10 @@ class QualysClient:
                                          resp_data.get("hasMore"))
             last_seen_id = resp_data.get("lastSeenAssetId",
                                          resp_data.get("lastId"))
+            # Optional: many tenants also return a per-page `count`. Use
+            # it for diagnostics but don't trust it for control flow —
+            # we use len(assets) which is what we actually parsed.
+            page_count_reported = resp_data.get("count")
 
             # Normalise hasMore: Qualys returns int 1/0 in some
             # versions, bool in others. We treat anything truthy as 1
@@ -1135,6 +1154,44 @@ class QualysClient:
             # warning) from "explicit 0" (clean termination).
             has_more_missing = has_more_raw is None
             has_more = bool(has_more_raw) if not has_more_missing else False
+
+            # ── Per-call DEBUG: what we got back ────────────────
+            #
+            # Full response shape so a confused operator can read
+            # exactly what Qualys said on each page. Catches:
+            #   * Silent page-size clamping (asked 300, got 100)
+            #   * Unexpected response shapes (top-level keys differ)
+            #   * Mismatched count vs len(assets) (parser bug)
+            #   * Premature hasMoreRecords=0 (the "only ran twice" case)
+            logger.debug(
+                f"CSAM page {page} response: "
+                f"HTTP {response.status_code}, "
+                f"responseCode={response_code!r}, "
+                f"assets_in_page={len(assets)}, "
+                f"reported_count={page_count_reported!r}, "
+                f"hasMoreRecords={has_more_raw!r}, "
+                f"lastSeenAssetId={last_seen_id!r}, "
+                f"elapsed_ms={elapsed_ms}, "
+                f"top_level_keys={list(resp_data.keys())}"
+            )
+
+            # ── Per-page INFO: visible at default log level ─────
+            #
+            # One concise line per page so a 2-page mystery pull is
+            # immediately visible without flipping to DEBUG. On a
+            # 1000-page pull this produces 1000 INFO lines (~120KB
+            # of log) which is acceptable for an audit trail.
+            page_size_msg = (
+                f" (asked {page_size}, got {len(assets)})"
+                if len(assets) != page_size and len(assets) > 0
+                else ""
+            )
+            logger.info(
+                f"CSAM page {page}: {len(assets)} assets, "
+                f"hasMore={1 if has_more else 0}, "
+                f"lastSeenAssetId={last_seen_id} ({elapsed_ms}ms)"
+                f"{page_size_msg}"
+            )
 
             # Fire the checkpoint callback AFTER we've updated our state for
             # this page. The callback gets this page's freshly-fetched assets
@@ -1150,19 +1207,19 @@ class QualysClient:
                         f"CSAM on_page callback raised (ignored): {cb_err}"
                     )
 
+            # Cumulative milestone every 10 pages so a long pull has a
+            # readable progress trail when scanning the log file.
             if page % 10 == 0:
                 if expected:
+                    pct = (len(all_assets) / expected) * 100 if expected else 0
                     logger.info(
-                        f"  CSAM assets: fetched {len(all_assets):,} of "
-                        f"{expected:,} (page {page}, "
-                        f"lastSeenAssetId={last_seen_id}, "
-                        f"hasMore={1 if has_more else 0})"
+                        f"CSAM milestone: fetched {len(all_assets):,} of "
+                        f"{expected:,} ({pct:.1f}%) at page {page}"
                     )
                 else:
                     logger.info(
-                        f"  CSAM assets: fetched {len(all_assets)} so far "
-                        f"(page {page}, lastSeenAssetId={last_seen_id}, "
-                        f"hasMore={1 if has_more else 0})"
+                        f"CSAM milestone: fetched {len(all_assets):,} "
+                        f"assets at page {page}"
                     )
 
             # ── Termination decisions, in priority order ────────
@@ -1224,6 +1281,29 @@ class QualysClient:
             logger.warning(
                 f"CSAM assets: fetched {len(all_assets):,} but count endpoint "
                 f"reported {expected:,} (drift of {len(all_assets) - expected:+,})"
+            )
+
+        # Suspicious-early-termination heads-up. If Qualys signalled
+        # `hasMore=0` after very few pages and we pulled far less than
+        # the count endpoint expected, surface a hint so the operator
+        # knows where to look. Common causes:
+        #   * Lookback filter unexpectedly restrictive
+        #   * Filter QQL fallback path consumed page 1 differently
+        #   * Tenant returning "you've been throttled, no more for now"
+        #     as a clean hasMore=0 instead of a 429
+        if (exit_reason == "hasMore=0"
+                and expected is not None and expected > 0
+                and len(all_assets) < expected * 0.5
+                and page <= 5):
+            logger.warning(
+                f"CSAM pull terminated cleanly (hasMore=0) after only "
+                f"{page} pages with {len(all_assets):,} assets, but "
+                f"count endpoint reported {expected:,}. This is "
+                f"suspicious — check: (a) `csam_lookback_days` config "
+                f"isn't unintentionally narrow; (b) the filter QQL "
+                f"wasn't rejected and silently fallback'd; (c) tenant "
+                f"isn't returning early-truncation as a clean response. "
+                f"Enable DEBUG logging to see per-page request/response."
             )
 
         # Final summary line — operators / log scrapers key on this.
