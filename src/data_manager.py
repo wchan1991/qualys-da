@@ -273,8 +273,12 @@ class DataManager:
         # Fresh start path: allocate a new snapshot timestamp and write it
         # into the checkpoint BEFORE the first page, so a crash between
         # allocation and first-page-save still leaves the checkpoint valid.
+        # Important: zero out assets_pulled / query_iteration / expected_count
+        # so a fresh start after a previous completed pull doesn't accidentally
+        # carry forward the prior run's counts.
         started_now = datetime.utcnow().isoformat()
-        if resume_from is None:
+        is_cold_start = resume_from is None
+        if is_cold_start:
             snapshot_fetched_at = started_now
             self.db.update_csam_checkpoint(
                 last_asset_id=None,
@@ -284,13 +288,32 @@ class DataManager:
                 started_at=started_now,
                 note="running",
                 snapshot_fetched_at=snapshot_fetched_at,
+                expected_count=expected,  # reset for the new snapshot
+                query_iteration=1,        # reset for the new snapshot
             )
 
         # Must be non-None by now — we either resumed an existing snapshot
         # or allocated a new one.
         assert snapshot_fetched_at is not None
 
+        # Track the running asset count ACROSS ALL continuation queries
+        # in this wrapper invocation. The inner fetch_csam_assets passes
+        # `total` = its OWN running count (resets to 0 at the start of
+        # each query), so we can't just write that to the checkpoint —
+        # query 2's `total=70` would overwrite query 1's persisted 50,000.
+        # Instead, advance this closure-local counter by `len(page_assets)`
+        # on each on_page fire and persist the cross-query total.
+        # Initialised from the checkpoint ONLY on a resume (otherwise we
+        # carry forward the prior completed pull's count of 120 even
+        # though the new snapshot started at 0).
+        cross_query_total = (
+            checkpoint.get("assets_pulled", 0)
+            if (checkpoint and not is_cold_start)
+            else 0
+        )
+
         def _on_page(page, total, last_id, has_more, page_assets):
+            nonlocal cross_query_total
             # (Fix 1) Persist this page's assets under the stable snapshot
             # timestamp FIRST. save_csam_assets uses INSERT OR REPLACE on
             # (asset_id, fetched_at), so re-running the same page (e.g.
@@ -309,11 +332,13 @@ class DataManager:
                         f"CSAM save_csam_assets failed on page {page}: {save_err}"
                     )
                     raise
+            # Advance the cross-query running total by THIS page's size.
+            cross_query_total += len(page_assets) if page_assets else 0
             # Then update the checkpoint so the resume pointer can't
             # outrun the persisted rows.
             self.db.update_csam_checkpoint(
                 last_asset_id=last_id,
-                assets_pulled=total,
+                assets_pulled=cross_query_total,
                 completed=(not has_more),
                 lookback_days=self.config.csam_lookback_days,
                 note=f"page {page}",
@@ -326,7 +351,7 @@ class DataManager:
             if refresh_id is not None:
                 try:
                     self.db.update_refresh_progress(
-                        refresh_id, csam_count=total
+                        refresh_id, csam_count=cross_query_total
                     )
                 except Exception as prog_err:
                     logger.debug(
@@ -349,26 +374,224 @@ class DataManager:
                 snapshot_fetched_at=snapshot_fetched_at,
             )
 
+        # ── Outer continuation loop ──────────────────────────────
+        #
+        # Why this exists: Qualys silently caps a single CSAM query at
+        # ~50,000 assets. The query terminates with a clean
+        # `hasMoreRecords=0` even when the tenant has more matching
+        # assets — there's no error or 429 to react to. Without an
+        # outer loop, every pull on a 250k-asset tenant returns 50k
+        # and exits "successfully."
+        #
+        # The fix: after each inner-loop call exits with
+        # `hasMoreRecords=0`, compare `total_fetched` against the
+        # preflight `expected` count. If we're more than `tolerance`
+        # short AND we made progress on the last iteration (cursor
+        # advanced), launch another inner-loop run starting from the
+        # final cursor of the previous query. Repeat until we hit the
+        # target or stall.
+        #
+        # Stall guard: if an iteration produces zero new assets, we
+        # bail to avoid an infinite loop. Same `last_seen_id` returned
+        # twice in a row is the within-loop variant; this guard is the
+        # cross-loop equivalent.
+        #
+        # On preflight failure (`expected is None`), the continuation
+        # guard is disabled — we trust the inner loop's `hasMore=0` as
+        # the authoritative termination signal because we have no
+        # target to compare against. Same approach as the within-loop
+        # drift logic.
+
+        # Tolerance: 1% of expected, floor at 100 assets. Real fleets
+        # have a small amount of natural churn between the count call
+        # and the pull's last page (assets added/removed mid-pull),
+        # so a strict equality check would false-positive constantly.
+        tolerance = (max(100, int(expected * 0.01))
+                     if expected is not None else 0)
+
+        # Resume can pick up mid-continuation. The checkpoint stores
+        # which iteration the previous run was on so log lines stay
+        # human-readable across crash/restart boundaries.
+        # On cold start, ALWAYS reset to 1 even if the prior (completed)
+        # checkpoint had a higher counter.
+        query_iteration = (
+            checkpoint.get("query_iteration", 1)
+            if (checkpoint and not is_cold_start)
+            else 1
+        )
+        # Persist `expected_count` on the first run so a resume can
+        # skip the preflight call. Also wires up `query_iteration` for
+        # log formatting on the next inner-loop call.
         try:
-            assets = self.client.fetch_csam_assets(
-                expected=expected,
+            self.db.update_csam_checkpoint(
+                last_asset_id=resume_from,
+                assets_pulled=(
+                    checkpoint.get("assets_pulled", 0) if checkpoint else 0
+                ),
+                completed=False,
                 lookback_days=self.config.csam_lookback_days,
-                resume_from_id=resume_from,
-                on_page=_on_page,
-                on_filter_fallback=_on_filter_fallback,
+                note=f"continuation iteration {query_iteration}",
+                snapshot_fetched_at=snapshot_fetched_at,
+                expected_count=expected,
+                query_iteration=query_iteration,
             )
-            # Clean completion — mark done AND clear snapshot_fetched_at so
-            # the next refresh starts fresh (won't accidentally try to
-            # extend a stale snapshot).
+        except Exception:
+            # Non-fatal: if the checkpoint write hiccups, the inner
+            # loop's per-page on_page callback will overwrite this
+            # row with a fresh one anyway.
+            pass
+
+        all_assets: List[Dict] = []
+        current_cursor: Optional[str] = resume_from
+        total_before_iteration: int = 0
+
+        try:
+            while True:
+                # Snapshot the running total before the inner-loop call so
+                # we can detect stalls (no progress this iteration).
+                before_count = (
+                    self.db.get_csam_checkpoint() or {}
+                ).get("assets_pulled", 0)
+
+                if query_iteration > 1:
+                    logger.info(
+                        f"CSAM continuation: query #{query_iteration} "
+                        f"starting ({before_count:,} of "
+                        f"{expected if expected else '?'} fetched, "
+                        f"continuing from lastSeenAssetId={current_cursor})"
+                    )
+
+                # Pass `expected=None` to the inner loop so its built-in
+                # drift / suspicious-early-termination warnings don't fire
+                # mid-continuation (we'll do the final drift check here at
+                # the end). Suppresses noise like "only got 50k of 250k!"
+                # being logged after every continuation iteration.
+                iteration_assets = self.client.fetch_csam_assets(
+                    expected=None,
+                    lookback_days=self.config.csam_lookback_days,
+                    resume_from_id=current_cursor,
+                    on_page=_on_page,
+                    on_filter_fallback=_on_filter_fallback,
+                )
+                all_assets.extend(iteration_assets)
+
+                # Re-read the checkpoint to get the latest cursor and
+                # total — the on_page callback wrote them, not us.
+                latest = self.db.get_csam_checkpoint() or {}
+                current_cursor = latest.get("last_asset_id")
+                total_fetched = latest.get("assets_pulled", 0)
+
+                logger.info(
+                    f"CSAM inner loop complete: hasMore=0, "
+                    f"fetched {len(iteration_assets):,} assets in this "
+                    f"query (cumulative {total_fetched:,})"
+                )
+
+                # ── Decide whether to continue ──────────────
+                if expected is None:
+                    # No preflight target — trust the inner loop's
+                    # hasMore=0 and stop.
+                    break
+                if total_fetched >= expected - tolerance:
+                    # Hit the target (or close enough) — done.
+                    break
+                if total_fetched <= before_count:
+                    # No progress this iteration. Bail to avoid an
+                    # infinite loop. Possibilities: cursor at end of
+                    # tenant assets but expected was inflated (count
+                    # endpoint counts disabled assets we don't return);
+                    # filter mismatch between count and search.
+                    logger.warning(
+                        f"CSAM continuation made no progress on "
+                        f"iteration {query_iteration}. Stopping at "
+                        f"{total_fetched:,} / {expected:,} expected."
+                    )
+                    break
+                if not current_cursor:
+                    # hasMore=0 with null cursor on a short pull — we
+                    # can't continue without a starting point.
+                    logger.warning(
+                        f"CSAM continuation cannot continue: inner loop "
+                        f"returned hasMore=0 with null lastSeenAssetId, "
+                        f"but only {total_fetched:,} of {expected:,} "
+                        f"expected fetched. Stopping."
+                    )
+                    break
+
+                # Cancel check between continuation iterations.
+                if self._cancel_event.is_set():
+                    raise CancelledError(
+                        f"CSAM continuation cancelled between iteration "
+                        f"{query_iteration} and the next "
+                        f"({total_fetched:,} assets persisted)"
+                    )
+
+                # Set up the next iteration.
+                query_iteration += 1
+                # Persist the iteration counter so a resume picks up the
+                # correct numbering.
+                try:
+                    self.db.update_csam_checkpoint(
+                        last_asset_id=current_cursor,
+                        assets_pulled=total_fetched,
+                        completed=False,
+                        lookback_days=self.config.csam_lookback_days,
+                        note=f"continuation iteration {query_iteration}",
+                        snapshot_fetched_at=snapshot_fetched_at,
+                        query_iteration=query_iteration,
+                    )
+                except Exception:
+                    pass  # see earlier comment
+
+            # ── Final classification + drift logging ─────────
+            final_total = (
+                self.db.get_csam_checkpoint() or {}
+            ).get("assets_pulled", len(all_assets))
+
+            if expected is not None:
+                drift = final_total - expected
+                drift_pct = (
+                    abs(drift) / expected * 100 if expected > 0 else 0
+                )
+                if abs(drift) <= tolerance:
+                    logger.info(
+                        f"CSAM pull complete: {final_total:,} assets "
+                        f"across {query_iteration} queries (expected: "
+                        f"{expected:,}, drift: {drift:+,} = "
+                        f"{drift_pct:.1f}%)"
+                    )
+                else:
+                    logger.warning(
+                        f"CSAM pull stopped early: {final_total:,} / "
+                        f"{expected:,} assets fetched ({drift_pct:.1f}% "
+                        f"short) across {query_iteration} continuation "
+                        f"queries. Diagnostic hints: check "
+                        f"`csam_lookback_days`, filter QQL fallback, "
+                        f"or enable DEBUG logging to see per-call "
+                        f"request/response."
+                    )
+            else:
+                logger.info(
+                    f"CSAM pull complete: {final_total:,} assets across "
+                    f"{query_iteration} queries (preflight count was "
+                    f"unavailable, no drift comparison)."
+                )
+
+            # Clean completion — mark done AND clear snapshot_fetched_at
+            # so the next refresh starts fresh (won't accidentally try
+            # to extend a stale snapshot).
             self.db.update_csam_checkpoint(
                 last_asset_id=None,
-                assets_pulled=len(assets),
+                assets_pulled=final_total,
                 completed=True,
                 lookback_days=self.config.csam_lookback_days,
                 note="complete",
                 snapshot_fetched_at=None,
+                # Reset iteration counter on clean completion so the
+                # next snapshot's continuation log starts at #1.
+                query_iteration=1,
             )
-            return assets, snapshot_fetched_at
+            return all_assets, snapshot_fetched_at
         except Exception as e:
             # on_page has already persisted rows + checkpoint up to the last
             # successful page; just annotate why the pull stopped. We
@@ -381,6 +604,10 @@ class DataManager:
                 completed=False,
                 lookback_days=self.config.csam_lookback_days,
                 note=f"interrupted: {type(e).__name__}: {e}"[:200],
+                # Preserve query_iteration so a resume continues the
+                # correct numbering. snapshot_fetched_at preserved by
+                # default (sentinel).
+                query_iteration=query_iteration,
             )
             raise
 

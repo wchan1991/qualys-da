@@ -348,20 +348,35 @@ class QualysDADatabase:
                 completed INTEGER DEFAULT 0,
                 lookback_days INTEGER,
                 note TEXT,
-                snapshot_fetched_at TEXT
+                snapshot_fetched_at TEXT,
+                expected_count INTEGER,
+                query_iteration INTEGER DEFAULT 1
             )
         """)
-        # Idempotent migration for databases created before snapshot_fetched_at
-        # was introduced. Without this column, a resumed pull would write the
-        # tail-half of the fleet under a *new* fetched_at and the dashboard
-        # would silently drop to half its host count. See BACKLOG.md.
-        try:
-            cursor.execute(
-                "ALTER TABLE csam_checkpoint ADD COLUMN snapshot_fetched_at TEXT"
-            )
-            logger.info("Migrated csam_checkpoint: added snapshot_fetched_at")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # Idempotent migrations for older DBs. Each ALTER TABLE is
+        # wrapped in try/except so a column that already exists doesn't
+        # raise. Order doesn't matter — `OperationalError: duplicate
+        # column name` is the only expected failure here.
+        for column_def, log_msg in (
+            ("ADD COLUMN snapshot_fetched_at TEXT",
+             "Migrated csam_checkpoint: added snapshot_fetched_at"),
+            # The continuation columns (expected_count, query_iteration)
+            # back the outer cross-query continuation loop in
+            # `_fetch_csam_with_checkpoint`. `expected_count` lets a
+            # resumed run skip the preflight count call (use the value
+            # from when the snapshot started); `query_iteration` tells
+            # us whether the previous run was already mid-continuation
+            # so we log #2/#3/etc. correctly. See docs/CSAM_PAGINATION.md.
+            ("ADD COLUMN expected_count INTEGER",
+             "Migrated csam_checkpoint: added expected_count"),
+            ("ADD COLUMN query_iteration INTEGER DEFAULT 1",
+             "Migrated csam_checkpoint: added query_iteration"),
+        ):
+            try:
+                cursor.execute(f"ALTER TABLE csam_checkpoint {column_def}")
+                logger.info(log_msg)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
         # ── Health Log ───────────────────────────────────────────
         # Periodic API availability heartbeat. Populated by the
@@ -751,7 +766,8 @@ class QualysDADatabase:
         """Return the current CSAM checkpoint row, or None if no pull has run."""
         row = self.conn.execute(
             "SELECT last_asset_id, assets_pulled, started_at, updated_at, "
-            "completed, lookback_days, note, snapshot_fetched_at "
+            "completed, lookback_days, note, snapshot_fetched_at, "
+            "expected_count, query_iteration "
             "FROM csam_checkpoint WHERE id = 1"
         ).fetchone()
         if not row:
@@ -765,6 +781,8 @@ class QualysDADatabase:
             "lookback_days": row[5],
             "note": row[6],
             "snapshot_fetched_at": row[7],
+            "expected_count": row[8],
+            "query_iteration": row[9] if row[9] is not None else 1,
         }
 
     # Sentinel distinguishing "caller didn't pass this field" from "caller
@@ -778,25 +796,40 @@ class QualysDADatabase:
                                lookback_days: Optional[int] = None,
                                started_at: Optional[str] = None,
                                note: Optional[str] = None,
-                               snapshot_fetched_at: Any = _UNSET) -> None:
+                               snapshot_fetched_at: Any = _UNSET,
+                               expected_count: Any = _UNSET,
+                               query_iteration: Any = _UNSET) -> None:
         """Upsert the single checkpoint row. `started_at` is preserved across
         updates when None — we only set it on the very first page of a run.
 
-        `snapshot_fetched_at` follows the same preservation rule but via an
-        explicit sentinel: omit the argument to keep the existing value;
-        pass `None` to clear it (on clean completion); pass a string to set it.
+        `snapshot_fetched_at`, `expected_count`, and `query_iteration` follow
+        the same preservation rule via an explicit sentinel: omit the argument
+        to keep the existing value; pass `None` to clear it (on clean
+        completion or when preflight count was unavailable); pass a value
+        to set it.
         """
         now = datetime.utcnow().isoformat()
         existing = self.get_csam_checkpoint()
+
+        def resolve(arg, default):
+            """Sentinel-aware: _UNSET means 'preserve existing'; anything
+            else is the new value (including None, which clears the
+            column)."""
+            return default if arg is self._UNSET else arg
+
         if existing is None:
-            snap_value = None if snapshot_fetched_at is self._UNSET else snapshot_fetched_at
+            snap_value = resolve(snapshot_fetched_at, None)
+            exp_value = resolve(expected_count, None)
+            qi_value = resolve(query_iteration, 1)
             self.conn.execute(
                 """INSERT INTO csam_checkpoint
                    (id, last_asset_id, assets_pulled, started_at, updated_at,
-                    completed, lookback_days, note, snapshot_fetched_at)
-                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    completed, lookback_days, note, snapshot_fetched_at,
+                    expected_count, query_iteration)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (last_asset_id, assets_pulled, started_at or now, now,
-                 1 if completed else 0, lookback_days, note, snap_value),
+                 1 if completed else 0, lookback_days, note, snap_value,
+                 exp_value, qi_value),
             )
         else:
             # Keep the original started_at unless the caller is explicitly
@@ -804,19 +837,25 @@ class QualysDADatabase:
             # next update is a fresh start; we detect that on the caller side
             # by passing started_at explicitly).
             preserved_start = started_at or existing["started_at"] or now
-            snap_value = (
-                existing.get("snapshot_fetched_at")
-                if snapshot_fetched_at is self._UNSET
-                else snapshot_fetched_at
+            snap_value = resolve(
+                snapshot_fetched_at, existing.get("snapshot_fetched_at")
+            )
+            exp_value = resolve(
+                expected_count, existing.get("expected_count")
+            )
+            qi_value = resolve(
+                query_iteration, existing.get("query_iteration") or 1
             )
             self.conn.execute(
                 """UPDATE csam_checkpoint
                    SET last_asset_id=?, assets_pulled=?, started_at=?,
                        updated_at=?, completed=?, lookback_days=?, note=?,
-                       snapshot_fetched_at=?
+                       snapshot_fetched_at=?, expected_count=?,
+                       query_iteration=?
                    WHERE id=1""",
                 (last_asset_id, assets_pulled, preserved_start, now,
-                 1 if completed else 0, lookback_days, note, snap_value),
+                 1 if completed else 0, lookback_days, note, snap_value,
+                 exp_value, qi_value),
             )
         self.conn.commit()
 
