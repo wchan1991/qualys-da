@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Iterator
 
 from .config_loader import QualysDAConfig
@@ -445,7 +445,123 @@ class DataManager:
         current_cursor: Optional[str] = resume_from
         total_before_iteration: int = 0
 
+        # ── Lookback bucketing ─────────────────────────────────
+        #
+        # When `csam_lookback_buckets > 1` and a lookback is set, split
+        # the lookback window into N independent paginated queries —
+        # each with its own cursor lifecycle and its own
+        # `lastCheckedIn` band as a QQL filter.
+        #
+        # Why: on tenants where Qualys's pagination cursor stalls or
+        # caps a single query at fewer assets than match the filter,
+        # smaller per-bucket queries (a) carry fewer matching assets,
+        # less likely to hit a per-query cap, and (b) start with a
+        # fresh cursor lifecycle, dodging the stall.
+        #
+        # Buckets cover the lookback window oldest-first:
+        #   bucket 0 (most recent):  lastCheckedIn >= cutoff_low
+        #   bucket 1:                lastCheckedIn >= L1 AND < H1
+        #   ...
+        # The newest bucket has no upper bound so an asset that just
+        # checked in between the preflight count and the actual pull
+        # still gets pulled.
+        n_buckets = max(1, getattr(self.config, "csam_lookback_buckets", 1))
+        lookback_days = self.config.csam_lookback_days
+        bucket_filters: List[Tuple[Optional[str], str]] = []
+        if n_buckets > 1 and lookback_days > 0:
+            bucket_size = lookback_days / n_buckets
+            now = datetime.utcnow()
+            for i in range(n_buckets):
+                days_min = i * bucket_size
+                days_max = (i + 1) * bucket_size
+                cutoff_high = now - timedelta(days=days_min)
+                cutoff_low = now - timedelta(days=days_max)
+                cutoff_high_iso = cutoff_high.strftime("%Y-%m-%dT%H:%M:%SZ")
+                cutoff_low_iso = cutoff_low.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if i == 0:
+                    qql = f"lastCheckedIn >= '{cutoff_low_iso}'"
+                else:
+                    qql = (
+                        f"lastCheckedIn >= '{cutoff_low_iso}' AND "
+                        f"lastCheckedIn < '{cutoff_high_iso}'"
+                    )
+                label = f"days {int(days_min)}-{int(days_max)} ago"
+                bucket_filters.append((qql, label))
+            logger.info(
+                f"CSAM bucketed pull: splitting {lookback_days}-day "
+                f"lookback into {n_buckets} buckets of "
+                f"~{bucket_size:.1f} days each."
+            )
+        else:
+            # Single-query mode (default). The continuation loop below
+            # handles per-query caps via cross-query continuation.
+            bucket_filters.append((None, "single query"))
+
         try:
+            # Bucketed path: each bucket = one full paginated query with
+            # its own cursor lifecycle. Skip the cross-query continuation
+            # loop because bucketing IS the workaround for per-query
+            # caps. If your buckets are too large for Qualys's
+            # per-query cap, increase `csam_lookback_buckets`.
+            if len(bucket_filters) > 1:
+                for bucket_idx, (bucket_filter, bucket_label) in enumerate(
+                    bucket_filters
+                ):
+                    if self._cancel_event.is_set():
+                        raise CancelledError(
+                            f"CSAM bucketed pull cancelled between "
+                            f"buckets at #{bucket_idx + 1}"
+                        )
+                    logger.info(
+                        f"CSAM bucket {bucket_idx + 1}/"
+                        f"{len(bucket_filters)} starting: {bucket_label}"
+                    )
+                    bucket_assets = self.client.fetch_csam_assets(
+                        expected=None,
+                        filter_qql_override=bucket_filter,
+                        resume_from_id=None,  # fresh cursor per bucket
+                        on_page=_on_page,
+                        on_filter_fallback=_on_filter_fallback,
+                    )
+                    all_assets.extend(bucket_assets)
+                    logger.info(
+                        f"CSAM bucket {bucket_idx + 1}/"
+                        f"{len(bucket_filters)} done: "
+                        f"{len(bucket_assets):,} assets in this bucket"
+                    )
+                # Final summary — bucketed path
+                final_total = (
+                    self.db.get_csam_checkpoint() or {}
+                ).get("assets_pulled", len(all_assets))
+                if expected is not None:
+                    drift = final_total - expected
+                    drift_pct = (
+                        abs(drift) / expected * 100 if expected > 0 else 0
+                    )
+                    logger.info(
+                        f"CSAM bucketed pull complete: {final_total:,} "
+                        f"assets across {len(bucket_filters)} buckets "
+                        f"(expected: {expected:,}, drift: {drift:+,} = "
+                        f"{drift_pct:.1f}%)"
+                    )
+                else:
+                    logger.info(
+                        f"CSAM bucketed pull complete: {final_total:,} "
+                        f"assets across {len(bucket_filters)} buckets"
+                    )
+                # Mark complete (clean exit)
+                self.db.update_csam_checkpoint(
+                    last_asset_id=None,
+                    assets_pulled=final_total,
+                    completed=True,
+                    lookback_days=self.config.csam_lookback_days,
+                    note="complete (bucketed)",
+                    snapshot_fetched_at=None,
+                    query_iteration=1,
+                )
+                return all_assets, snapshot_fetched_at
+
+            # Single-query path: cross-query continuation loop (existing).
             while True:
                 # Snapshot the running total before the inner-loop call so
                 # we can detect stalls (no progress this iteration).

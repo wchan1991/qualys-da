@@ -178,6 +178,54 @@ checkpoint; the next refresh:
 3. Resumes the inner loop from the saved `last_asset_id` and continues
    the outer loop from there.
 
+## Lookback bucketing — guaranteed full pull
+
+When Qualys's pagination cursor stalls or caps a single query short of
+the matching fleet size on your tenant, set `csam_lookback_buckets > 1`
+in `config/.config`. The wrapper splits the lookback window into N
+independent paginated queries:
+
+```
+csam_lookback_days = 90
+csam_lookback_buckets = 6
+```
+
+→ runs 6 queries, each scoped to a 15-day band:
+
+| Bucket | Filter |
+|---|---|
+| 1 | `lastCheckedIn >= <15 days ago>` |
+| 2 | `lastCheckedIn >= <30 days ago> AND lastCheckedIn < <15 days ago>` |
+| 3 | `lastCheckedIn >= <45 days ago> AND lastCheckedIn < <30 days ago>` |
+| 4 | `lastCheckedIn >= <60 days ago> AND lastCheckedIn < <45 days ago>` |
+| 5 | `lastCheckedIn >= <75 days ago> AND lastCheckedIn < <60 days ago>` |
+| 6 | `lastCheckedIn >= <90 days ago> AND lastCheckedIn < <75 days ago>` |
+
+Each bucket has:
+- Its own cursor lifecycle (fresh `startFromId=None` on the first call)
+- Its own `hasMoreRecords=0` termination signal
+- A narrower filter, so fewer matching assets per query → less likely
+  to hit Qualys's per-query asset cap
+
+Bucket 1 (most recent) deliberately has no upper bound so an asset that
+checks in between the preflight count and the actual pull still gets
+pulled.
+
+**When to use bucketing:**
+- A single-query pull caps short of the count-endpoint preflight value
+- The cosmetic-cursor warning fires AND the pull stops short
+- You want to guarantee full coverage on a one-shot ingestion
+
+**When NOT to use bucketing:**
+- Single-query pulls are working — the bucketed path doesn't use the
+  cross-query continuation loop, so on tenants where the single-query
+  + continuation strategy works it has slightly more API overhead.
+- Default is `csam_lookback_buckets = 1` (preserves single-query path
+  with continuation loop).
+
+Bucketing AND continuation are independent — you pick one. Buckets > 1
+takes the bucketed path; otherwise the continuation loop runs.
+
 ## Page size
 
 Default is **1000 assets per page** (`csam_page_size = 1000` in

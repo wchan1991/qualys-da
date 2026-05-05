@@ -45,6 +45,13 @@ csam_page_size = 1000
 # 'lastCheckedIn'). Dramatically cuts API volume for big tenants. Set to 0
 # to disable the filter and pull everything.
 csam_lookback_days = 90
+# Split the lookback window into N independent paginated queries, each with
+# its own cursor lifecycle. 1 = single query (default). >1 = bucketed pulls
+# that work around Qualys-side cursor stalls or per-query caps; e.g. 6
+# buckets with csam_lookback_days=90 runs 6 queries of 15 days each.
+# Recommended: leave at 1 unless you've observed a single-query refresh
+# capping short of expected_count. See docs/CSAM_PAGINATION.md.
+csam_lookback_buckets = 1
 # If a pull is interrupted (rate-limit / crash / killed mid-run), remember the
 # last asset ID and resume from there next time. Set to false to always start
 # from the beginning.

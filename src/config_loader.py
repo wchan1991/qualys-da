@@ -53,6 +53,17 @@ class QualysDAConfig:
                                     # 2026-05-05 and docs/CSAM_PAGINATION.md.
     csam_lookback_days: int = 90    # Server-side QQL filter on 'lastCheckedIn'.
                                     # 0 = no filter (pull everything).
+    csam_lookback_buckets: int = 1  # Split the lookback window into N
+                                    # independent paginated queries (each
+                                    # with its own cursor lifecycle). 1 =
+                                    # single query (current behaviour).
+                                    # >1 = bucketed pulls — works around
+                                    # tenants where Qualys's pagination
+                                    # cursor stalls or caps a single query
+                                    # at <fleet size. E.g. value 6 with
+                                    # csam_lookback_days=90 gives 6
+                                    # buckets of 15 days each. See
+                                    # docs/CSAM_PAGINATION.md.
     csam_resume_enabled: bool = True  # Resume from last asset ID if a prior pull
                                       # was interrupted (rate-limit / crash).
     csam_max_window_hops: int = 3   # On 429, sleep ToWait-Sec and retry up to
@@ -231,6 +242,7 @@ def load_config(config_path: Optional[Path] = None) -> QualysDAConfig:
         parallel_refresh=get_bool("api", "parallel_refresh", True),
         csam_page_size=get_int("api", "csam_page_size", 1000),
         csam_lookback_days=get_int("api", "csam_lookback_days", 90),
+        csam_lookback_buckets=get_int("api", "csam_lookback_buckets", 1),
         csam_resume_enabled=get_bool("api", "csam_resume_enabled", True),
         csam_max_window_hops=get_int("api", "csam_max_window_hops", 3),
         csam_max_window_wait=get_int("api", "csam_max_window_wait", 3600),

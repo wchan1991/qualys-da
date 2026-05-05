@@ -938,6 +938,7 @@ class QualysClient:
                           resume_from_id: Optional[str] = None,
                           on_page: Optional[Callable[..., None]] = None,
                           on_filter_fallback: Optional[Callable[[], None]] = None,
+                          filter_qql_override: Optional[str] = None,
                           ) -> List[Dict]:
         """Fetch assets from CSAM Asset Host Data API.
 
@@ -999,22 +1000,34 @@ class QualysClient:
         # 1000 keeps the cursor advancing normally.
         page_size = max(1, min(int(page_size), 1000))
 
-        # Resolve lookback: explicit arg wins, otherwise config default.
-        if lookback_days is None:
-            lookback_days = getattr(self.config, "csam_lookback_days", 0)
-        # Set filter_enabled up front; may be cleared by the 400-fallback below.
-        filter_enabled = bool(lookback_days and lookback_days > 0)
+        # Resolve filter QQL. Priority: explicit override > lookback_days
+        # arg > config default. The override path is used by the bucketed
+        # pull strategy in `_fetch_csam_with_checkpoint` to send a
+        # narrower per-bucket filter (e.g. `lastCheckedIn >= X AND
+        # lastCheckedIn < Y`) so each bucket gets its own cursor lifecycle.
         filter_qql: Optional[str] = None
-        if filter_enabled:
-            cutoff = datetime.utcnow() - timedelta(days=int(lookback_days))
-            cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
-            # QQL range syntax supported by CSAM v2 search.
-            filter_qql = f"lastCheckedIn >= '{cutoff_iso}'"
+        filter_enabled: bool = False
+        if filter_qql_override is not None:
+            filter_qql = filter_qql_override
+            filter_enabled = True
+        else:
+            if lookback_days is None:
+                lookback_days = getattr(self.config, "csam_lookback_days", 0)
+            # Set filter_enabled up front; may be cleared by the
+            # 400-fallback below.
+            filter_enabled = bool(lookback_days and lookback_days > 0)
+            if filter_enabled:
+                cutoff = datetime.utcnow() - timedelta(days=int(lookback_days))
+                cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+                # QQL range syntax supported by CSAM v2 search.
+                filter_qql = f"lastCheckedIn >= '{cutoff_iso}'"
 
         banner_bits = [f"page_size: {page_size}"]
         if expected is not None:
             banner_bits.insert(0, f"expected: {expected:,}")
-        if filter_enabled:
+        if filter_qql_override is not None:
+            banner_bits.append(f"filter: {filter_qql_override}")
+        elif filter_enabled:
             banner_bits.append(f"lookback: {lookback_days}d")
         if resume_from_id:
             banner_bits.append(f"resume_from_id: {resume_from_id}")
