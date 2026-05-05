@@ -8,17 +8,107 @@
 
 <!-- Data Refresh -->
 <div class="card">
-    <div class="card-header">Data Refresh</div>
+    <div class="card-header">
+        Data Refresh
+        <span style="font-weight:normal;font-size:12px;color:var(--text-muted);margin-left:8px;">
+            Pick the sources to pull, then click Refresh Selected
+        </span>
+    </div>
     <p style="color:var(--text-secondary);margin-bottom:12px;">
-        Pull the latest data from Qualys (CSAM assets, VM hosts, VM detections).
         Scheduled refresh runs automatically per your <code>config/.config</code> schedule.
+        Tick the sources you want pulled now and dispatch them in one click —
+        anything you don't tick is skipped.
     </p>
+
+    <!-- Source picker: row per API with inline freshness ──────── -->
+    <style>
+        .src-picker { display:grid; gap:6px; margin:8px 0 12px 0; }
+        .src-row {
+            display:grid; grid-template-columns: 22px 1fr auto auto;
+            gap:10px; align-items:center;
+            padding:10px 12px; border:1px solid var(--border-color);
+            border-radius:6px; background:var(--bg-secondary);
+            cursor:pointer; transition:background .12s, border-color .12s;
+        }
+        .src-row:hover { background:var(--bg-hover, var(--bg-tertiary)); }
+        .src-row.selected { border-color:var(--accent, #2563eb); background:var(--bg-selected, var(--bg-tertiary)); }
+        .src-row input[type="checkbox"] { margin:0; cursor:pointer; }
+        .src-name { font-weight:600; font-size:14px; }
+        .src-sub { font-size:12px; color:var(--text-muted); margin-top:2px; }
+        .src-meta { font-size:12px; color:var(--text-secondary); text-align:right; min-width:130px; }
+        .src-meta .src-count { font-weight:600; color:var(--text-primary); }
+        .src-dot {
+            width:10px; height:10px; border-radius:50%;
+            background:var(--text-muted); display:inline-block;
+        }
+        .src-dot.ok { background:#16a34a; }
+        .src-dot.warn { background:#ea580c; }
+        .src-dot.fail { background:#dc2626; }
+        .preset-chips { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+        .chip {
+            padding:4px 10px; border:1px solid var(--border-color);
+            border-radius:999px; background:var(--bg-secondary);
+            font-size:12px; cursor:pointer; color:var(--text-primary);
+        }
+        .chip:hover { background:var(--bg-hover, var(--bg-tertiary)); border-color:var(--accent, #2563eb); }
+        .chip:disabled { opacity:.5; cursor:not-allowed; }
+    </style>
+
+    <div class="src-picker" id="src-picker">
+        <label class="src-row" data-source="csam">
+            <input type="checkbox" class="src-cb" value="csam" checked>
+            <div>
+                <div class="src-name">CSAM Assets</div>
+                <div class="src-sub">Asset inventory · cursor pagination · per-page resume</div>
+            </div>
+            <div class="src-meta">
+                <div><span class="src-count" id="src-csam-count">—</span> assets</div>
+                <div id="src-csam-age">no snapshot yet</div>
+            </div>
+            <span class="src-dot" id="src-csam-dot" title="Last refresh status"></span>
+        </label>
+        <label class="src-row" data-source="vm-hosts">
+            <input type="checkbox" class="src-cb" value="vm-hosts" checked>
+            <div>
+                <div class="src-name">VM Hosts</div>
+                <div class="src-sub">Vulnerability Management host inventory + tags</div>
+            </div>
+            <div class="src-meta">
+                <div><span class="src-count" id="src-hosts-count">—</span> hosts</div>
+                <div id="src-hosts-age">no snapshot yet</div>
+            </div>
+            <span class="src-dot" id="src-hosts-dot" title="Last refresh status"></span>
+        </label>
+        <label class="src-row" data-source="vm-detections">
+            <input type="checkbox" class="src-cb" value="vm-detections" checked>
+            <div>
+                <div class="src-name">VM Detections</div>
+                <div class="src-sub">Per-host detection findings (typically the longest pull)</div>
+            </div>
+            <div class="src-meta">
+                <div><span class="src-count" id="src-dets-count">—</span> detections</div>
+                <div id="src-dets-age">no snapshot yet</div>
+            </div>
+            <span class="src-dot" id="src-dets-dot" title="Last refresh status"></span>
+        </label>
+    </div>
+
+    <!-- Quick presets ─────────────────────────────────────────── -->
+    <div class="preset-chips">
+        <button class="chip" onclick="presetSelect('all')" title="Tick all 3 sources">All</button>
+        <button class="chip" onclick="presetSelect('csam')" title="CSAM only — fastest single pull">CSAM only</button>
+        <button class="chip" onclick="presetSelect('vm')" title="VM Hosts + VM Detections">VM only</button>
+        <button class="chip" id="preset-failed-chip" onclick="presetSelect('failed')" title="Re-run any source that failed or stopped partial in the most recent refresh">Retry last failed</button>
+        <button class="chip" onclick="presetSelect('none')" title="Clear selection">Clear</button>
+    </div>
+
+    <!-- Action row ────────────────────────────────────────────── -->
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-        <button id="refresh-all-btn" class="btn btn-primary" onclick="triggerRefresh('all')">Refresh All</button>
-        <button class="btn" onclick="triggerRefresh('csam')">Refresh CSAM</button>
-        <button class="btn" onclick="triggerRefresh('vm-hosts')">Refresh VM Hosts</button>
-        <button class="btn" onclick="triggerRefresh('vm-detections')">Refresh VM Detections</button>
-        <span id="last-refresh" class="metric-label" style="margin-left:12px;"></span>
+        <button id="refresh-selected-btn" class="btn btn-primary" onclick="runSelectedRefresh()">
+            Refresh Selected (<span id="sel-count">3</span>)
+        </button>
+        <button id="cancel-refresh-btn" class="btn" onclick="cancelRefresh()" hidden>Cancel In-Flight</button>
+        <span id="last-refresh" class="metric-label" style="margin-left:auto;"></span>
     </div>
 </div>
 
@@ -183,18 +273,102 @@ function setDefaultView(v) {
     );
 })();
 
-async function triggerRefresh(source) {
-    const btn = document.getElementById('refresh-all-btn');
-    const url = source === 'all' ? '/api/refresh' : '/api/refresh/' + source;
-    showToast('Refresh started (' + source + ')…', 'success');
+// ── Selective refresh: tick sources, hit endpoints ───────────
+//
+// All-3-selected → POST /api/refresh (one combined refresh_log row)
+// Subset selected → parallel POST /api/refresh/<source> (one row per
+// source). Each per-source endpoint spawns its own daemon thread, so
+// dispatching N in parallel just kicks N independent pulls.
+
+const ALL_SOURCES = ['csam', 'vm-hosts', 'vm-detections'];
+
+function getSelectedSources() {
+    return Array.from(document.querySelectorAll('.src-cb:checked')).map(cb => cb.value);
+}
+
+function updateSelectedCount() {
+    const sel = getSelectedSources();
+    document.getElementById('sel-count').textContent = sel.length;
+    const btn = document.getElementById('refresh-selected-btn');
+    btn.disabled = (sel.length === 0);
+    // Visual highlight on each row reflecting tick state
+    document.querySelectorAll('.src-row').forEach(row => {
+        const cb = row.querySelector('.src-cb');
+        row.classList.toggle('selected', cb && cb.checked);
+    });
+}
+
+function presetSelect(preset) {
+    let want;
+    if (preset === 'all') want = new Set(ALL_SOURCES);
+    else if (preset === 'csam') want = new Set(['csam']);
+    else if (preset === 'vm') want = new Set(['vm-hosts', 'vm-detections']);
+    else if (preset === 'none') want = new Set();
+    else if (preset === 'failed') {
+        // Read latest refresh-log row, retry sources whose status was
+        // 'failed' or 'partial'. If none failed, fall through to 'all'.
+        want = window._lastFailedSources && window._lastFailedSources.size
+             ? window._lastFailedSources
+             : new Set(ALL_SOURCES);
+        if (!window._lastFailedSources || !window._lastFailedSources.size) {
+            showToast('No failed sources in the last refresh — selecting all', 'info');
+        }
+    } else return;
+    document.querySelectorAll('.src-cb').forEach(cb => {
+        cb.checked = want.has(cb.value);
+    });
+    updateSelectedCount();
+}
+
+async function runSelectedRefresh() {
+    const selected = getSelectedSources();
+    if (!selected.length) {
+        showToast('Pick at least one source to refresh', 'error');
+        return;
+    }
+    const btn = document.getElementById('refresh-selected-btn');
+    btn.disabled = true;
+    btn.textContent = 'Dispatching…';
     try {
-        await fetchApi(url, { method: 'POST' });
-        showToast('Refresh dispatched', 'success');
+        if (selected.length === ALL_SOURCES.length) {
+            // All 3 → one combined orchestrated pull
+            await fetchApi('/api/refresh', { method: 'POST' });
+            showToast('Full refresh started (all 3 sources)', 'success');
+        } else {
+            // Subset → fire each per-source endpoint in parallel
+            await Promise.all(selected.map(s =>
+                fetchApi('/api/refresh/' + s, { method: 'POST' })
+            ));
+            showToast('Refresh started: ' + selected.join(', '), 'success');
+        }
+        document.getElementById('cancel-refresh-btn').hidden = false;
         setTimeout(loadRefreshLog, 1200);
+        setTimeout(loadIngestionStats, 1500);
     } catch (e) {
         showToast('Refresh failed: ' + e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = 'Refresh Selected (<span id="sel-count">' + selected.length + '</span>)';
+        updateSelectedCount();
     }
 }
+
+async function cancelRefresh() {
+    try {
+        await fetchApi('/api/refresh/cancel', { method: 'POST' });
+        showToast('Cancel signal sent — workers will stop at next safe point', 'info');
+        document.getElementById('cancel-refresh-btn').hidden = true;
+        setTimeout(loadRefreshLog, 1500);
+    } catch (e) {
+        showToast('Cancel failed: ' + e.message, 'error');
+    }
+}
+
+// Wire up checkbox change events and initialize counter
+document.querySelectorAll('.src-cb').forEach(cb =>
+    cb.addEventListener('change', updateSelectedCount)
+);
+updateSelectedCount();
 
 async function loadRefreshLog() {
     const data = await fetchApi('/api/refresh-log');
@@ -233,6 +407,42 @@ async function loadRefreshLog() {
     if (data[0] && data[0].completed_at) {
         document.getElementById('last-refresh').textContent = 'Last: ' + data[0].completed_at.slice(0, 16);
     }
+
+    // ── Per-source dots + "retry last failed" preset population ──
+    //
+    // Walk the most recent refresh-log row and mirror per-API status
+    // onto the source-picker dots. Capture which sources ended in
+    // 'failed' or 'partial' so the "Retry last failed" chip knows what
+    // to tick.
+    const latest = data[0] || {};
+    const _statusToDot = (s) =>
+        s === 'success' ? 'ok' :
+        s === 'partial' ? 'warn' :
+        s === 'failed'  ? 'fail' : '';
+    const _setDot = (id, status) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.classList.remove('ok', 'warn', 'fail');
+        const cls = _statusToDot(status);
+        if (cls) el.classList.add(cls);
+        el.title = status ? ('Last refresh: ' + status) : 'No prior refresh';
+    };
+    _setDot('src-csam-dot',  latest.csam_status);
+    _setDot('src-hosts-dot', latest.vm_host_status);
+    _setDot('src-dets-dot',  latest.vm_detection_status);
+
+    const failed = new Set();
+    if (latest.csam_status === 'failed' || latest.csam_status === 'partial') failed.add('csam');
+    if (latest.vm_host_status === 'failed' || latest.vm_host_status === 'partial') failed.add('vm-hosts');
+    if (latest.vm_detection_status === 'failed' || latest.vm_detection_status === 'partial') failed.add('vm-detections');
+    window._lastFailedSources = failed;
+    const failedChip = document.getElementById('preset-failed-chip');
+    if (failedChip) {
+        failedChip.disabled = (failed.size === 0);
+        failedChip.textContent = failed.size
+            ? `Retry last failed (${failed.size})`
+            : 'Retry last failed';
+    }
 }
 
 loadRefreshLog();
@@ -257,6 +467,18 @@ async function loadIngestionStats() {
         document.getElementById('ig-csam-ts').textContent = d.csam_assets_latest ? _friendlyAge(d.csam_assets_latest) : 'no snapshot yet';
         document.getElementById('ig-hosts-ts').textContent = d.vm_hosts_latest ? _friendlyAge(d.vm_hosts_latest) : 'no snapshot yet';
         document.getElementById('ig-dets-ts').textContent = d.vm_detections_latest ? _friendlyAge(d.vm_detections_latest) : 'no snapshot yet';
+
+        // Mirror counts + freshness into the per-source picker rows so
+        // operators can decide what to refresh without scrolling.
+        const _setSrc = (idC, idA, count, latest) => {
+            const c = document.getElementById(idC);
+            const a = document.getElementById(idA);
+            if (c) c.textContent = (count || 0).toLocaleString();
+            if (a) a.textContent = latest ? _friendlyAge(latest) : 'no snapshot yet';
+        };
+        _setSrc('src-csam-count',  'src-csam-age',  d.csam_assets_count,    d.csam_assets_latest);
+        _setSrc('src-hosts-count', 'src-hosts-age', d.vm_hosts_count,       d.vm_hosts_latest);
+        _setSrc('src-dets-count',  'src-dets-age',  d.vm_detections_count,  d.vm_detections_latest);
 
         const h = d.refresh_history || {};
         document.getElementById('ig-refreshes').textContent = (h.total || 0).toLocaleString();

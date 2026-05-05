@@ -17,6 +17,19 @@ Format:
 Operator/engineer wishlist items not yet scheduled. Move into the dated change
 log once landed.
 
+- [ ] **Unbounded streaming CSV exports — "all the data" for pandas** — drop
+  the 100k row cap on `cli.py export` and `/api/export/csv`, switch all three
+  CSV-export paths to Flask `stream_with_context` so a 1M-row export uses ~5MB
+  of process memory regardless of fleet size, plumb the `date_from`/`date_to`
+  filters that `/api/export/csv` currently accepts and silently drops, and add
+  a single **"Export all tables (ZIP)"** button on Data Explorer that streams a
+  ZIP containing one CSV per table (`csam_assets`, `vm_hosts`, `vm_detections`,
+  `host_tags`, `detection_changes`, `health_log`, etc.) — one click pulls every
+  table out for offline pandas / DuckDB / Excel analysis. Plan drafted at
+  `~/.claude/plans/sharded-leaping-sphinx.md` with file-by-file changes,
+  streaming-generator design, and test scope. Closes the operator's literal
+  ask: "I want to export all CSAM and all data into respective CSVs to use
+  pandas on them."
 - [ ] **Field-reduction for CSAM payload** — opt-in config to request only the
   fields `save_csam_assets` actually stores, dropping the raw-JSON
   `raw_data` column. Response size should drop 60-80% on big tenants.
