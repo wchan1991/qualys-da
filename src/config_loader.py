@@ -37,8 +37,13 @@ class QualysDAConfig:
 
     # Refresh
     parallel_refresh: bool = True   # Pull VM and CSAM in parallel (~40-50% faster)
-    csam_page_size: int = 1000      # Assets per CSAM call (max 1000). 104k assets
-                                    # → 104 calls at 1000, vs 347 calls at 300.
+    csam_page_size: int = 300       # Assets per CSAM call. Qualys docs say
+                                    # the max is 1000, but we observe silent
+                                    # clamping to ~100 on some tenants. 300
+                                    # is the value Qualys's own QualysETL
+                                    # reference uses and it appears to be
+                                    # honoured without clamping. See
+                                    # docs/CSAM_PAGINATION.md.
     csam_lookback_days: int = 90    # Server-side QQL filter on 'lastCheckedIn'.
                                     # 0 = no filter (pull everything).
     csam_resume_enabled: bool = True  # Resume from last asset ID if a prior pull
@@ -217,7 +222,7 @@ def load_config(config_path: Optional[Path] = None) -> QualysDAConfig:
         rate_limit_enabled=get_bool("rate_limit", "enabled", True),
         calls_per_minute=get_int("rate_limit", "calls_per_minute", 60),
         parallel_refresh=get_bool("api", "parallel_refresh", True),
-        csam_page_size=get_int("api", "csam_page_size", 1000),
+        csam_page_size=get_int("api", "csam_page_size", 300),
         csam_lookback_days=get_int("api", "csam_lookback_days", 90),
         csam_resume_enabled=get_bool("api", "csam_resume_enabled", True),
         csam_max_window_hops=get_int("api", "csam_max_window_hops", 3),

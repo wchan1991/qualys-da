@@ -123,9 +123,16 @@ higher (e.g. `5`) for very large fleets that need 4+ windows.
 |---|---|
 | `src/api_client.py::_csam_apply_server_throttle` | Three-tier throttle |
 | `src/api_client.py::_csam_request` | 429 window-hop loop |
-| `src/api_client.py::fetch_csam_assets` | Page loop + on_page callback |
+| `src/api_client.py::fetch_csam_assets` | Page loop + on_page callback (see `CSAM_PAGINATION.md`) |
 | `src/api_client.py::count_csam_assets` | Preflight count endpoint |
 | `src/data_manager.py::_fetch_csam_with_checkpoint` | Resume + per-page persistence |
 | `src/database.py` (`csam_checkpoint`) | Resume cursor + snapshot timestamp |
 | `tests/test_csam_resume.py` | Resume-path invariants |
+| `tests/test_csam_pagination.py` | Cursor-driven pagination invariants |
 | `tests/test_parallel_refresh.py::ThrottleTiersTest` | Three-tier throttle invariants |
+
+## See also
+
+- [`CSAM_PAGINATION.md`](CSAM_PAGINATION.md) — the cursor contract, defensive
+  exit handling, and how pagination interacts with the rate-limit machinery
+  documented here.

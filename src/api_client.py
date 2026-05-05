@@ -931,7 +931,7 @@ class QualysClient:
 
     # ── Fetch CSAM Assets ────────────────────────────────────────
 
-    def fetch_csam_assets(self, max_pages: int = 500,
+    def fetch_csam_assets(self, max_pages: int = 10000,
                           expected: Optional[int] = None,
                           page_size: Optional[int] = None,
                           lookback_days: Optional[int] = None,
@@ -941,11 +941,29 @@ class QualysClient:
                           ) -> List[Dict]:
         """Fetch assets from CSAM Asset Host Data API.
 
+        Pagination is driven STRICTLY by Qualys's documented cursor
+        contract (`hasMoreRecords` / `hasMore` + `lastSeenAssetId`).
+        The loop terminates only when the API explicitly signals
+        `hasMoreRecords == 0` — never on a page count, asset count, or
+        empty-response heuristic. The `max_pages` parameter is a defensive
+        safety guard against runaway loops (e.g. server bug returning
+        `hasMore: 1` forever); at the default 10 000 pages × 300 assets
+        per page that ceiling is ~3 M assets, well above any plausible
+        tenant size. Hitting it logs a WARNING with the reason.
+
+        Background: a previous default of `max_pages=500` combined with
+        Qualys silently clamping `limitResults` to ~100 produced a hard
+        50 000-asset ceiling on big tenants regardless of true fleet
+        size. See docs/CSAM_PAGINATION.md.
+
         Parameters
         ----------
-        max_pages : safety cap on pagination loops.
+        max_pages : defensive safety guard on pagination loops. Normal
+            termination is `hasMoreRecords == 0`.
         expected  : total from count_csam_assets() for progress / drift logging.
-        page_size : assets per request (1-1000). Defaults to config.csam_page_size.
+        page_size : assets per request. Defaults to config.csam_page_size
+            (default 300 — Qualys's QualysETL reference uses this; higher
+            values appear to be silently clamped on some tenants).
         lookback_days : if > 0, server-side filter restricts to assets whose
             `lastCheckedIn` is within the last N days. 0 / None = no filter.
             If Qualys rejects the filter on the first page, we log a warning
@@ -969,8 +987,10 @@ class QualysClient:
         for every page we successfully consumed, so the checkpoint is current.
         """
         if page_size is None:
-            page_size = getattr(self.config, "csam_page_size", 1000)
-        # Qualys CSAM search accepts up to 1000; cap defensively.
+            page_size = getattr(self.config, "csam_page_size", 300)
+        # Qualys CSAM search accepts up to 1000 documented but appears to
+        # silently clamp larger values on some tenants — 300 is the value
+        # Qualys's own QualysETL reference uses.
         page_size = max(1, min(int(page_size), 1000))
 
         # Resolve lookback: explicit arg wins, otherwise config default.
@@ -996,8 +1016,14 @@ class QualysClient:
 
         all_assets: List[Dict] = []
         last_seen_id: Optional[str] = resume_from_id
+        prev_last_seen_id: Optional[str] = None  # for stall detection
         page = 0
         cancel = getattr(self, "_cancel_event", None)
+        # Track *why* the loop exited so we can log the right thing on
+        # the way out. Set to "hasMore=0" only when the API explicitly
+        # signalled completion; everything else is a defensive exit
+        # that warrants a WARNING.
+        exit_reason: str = "no termination signal"
 
         while page < max_pages:
             # Cooperative cancellation check between pages. Already-fetched
@@ -1096,8 +1122,19 @@ class QualysClient:
 
             all_assets.extend(assets)
 
-            has_more = resp_data.get("hasMoreRecords", resp_data.get("hasMore", False))
-            last_seen_id = resp_data.get("lastSeenAssetId", resp_data.get("lastId"))
+            # Cursor extraction. Both fields can be missing or null on
+            # different tenant versions — handle each defensively.
+            has_more_raw = resp_data.get("hasMoreRecords",
+                                         resp_data.get("hasMore"))
+            last_seen_id = resp_data.get("lastSeenAssetId",
+                                         resp_data.get("lastId"))
+
+            # Normalise hasMore: Qualys returns int 1/0 in some
+            # versions, bool in others. We treat anything truthy as 1
+            # but distinguish "field missing entirely" (defensive
+            # warning) from "explicit 0" (clean termination).
+            has_more_missing = has_more_raw is None
+            has_more = bool(has_more_raw) if not has_more_missing else False
 
             # Fire the checkpoint callback AFTER we've updated our state for
             # this page. The callback gets this page's freshly-fetched assets
@@ -1107,7 +1144,7 @@ class QualysClient:
             if on_page is not None:
                 try:
                     on_page(page, len(all_assets), last_seen_id,
-                            bool(has_more), assets)
+                            has_more, assets)
                 except Exception as cb_err:
                     logger.warning(
                         f"CSAM on_page callback raised (ignored): {cb_err}"
@@ -1117,23 +1154,91 @@ class QualysClient:
                 if expected:
                     logger.info(
                         f"  CSAM assets: fetched {len(all_assets):,} of "
-                        f"{expected:,} (page {page})"
+                        f"{expected:,} (page {page}, "
+                        f"lastSeenAssetId={last_seen_id}, "
+                        f"hasMore={1 if has_more else 0})"
                     )
                 else:
                     logger.info(
                         f"  CSAM assets: fetched {len(all_assets)} so far "
-                        f"(page {page})"
+                        f"(page {page}, lastSeenAssetId={last_seen_id}, "
+                        f"hasMore={1 if has_more else 0})"
                     )
 
-            if not has_more or not last_seen_id:
+            # ── Termination decisions, in priority order ────────
+            #
+            # 1. `hasMoreRecords` field missing entirely → defensive
+            #    treat as 0 + WARNING (per acceptance §6.4)
+            # 2. `hasMore == 0` → normal completion, the ONLY clean
+            #    termination signal per the API contract
+            # 3. `last_seen_id` is null/falsy with hasMore == 1 →
+            #    invalid server response (per §6.1) — abort
+            # 4. `last_seen_id` repeats from previous page (per §6.2)
+            #    → cursor stall, server-side issue, abort
+            #
+            # Empty asset[] with hasMore == 1 (per §6.3) is fine: the
+            # extend([]) is a no-op and we continue paginating.
+            if has_more_missing:
+                logger.warning(
+                    f"CSAM page {page}: response missing hasMoreRecords "
+                    f"field — treating as completion. Check API version."
+                )
+                exit_reason = "hasMore field missing (defensive)"
                 break
+            if not has_more:
+                exit_reason = "hasMore=0"
+                break
+            # has_more is True from here on
+            if not last_seen_id:
+                logger.warning(
+                    f"CSAM page {page}: hasMore=1 but lastSeenAssetId "
+                    f"is null/empty — invalid cursor, aborting to avoid "
+                    f"infinite loop."
+                )
+                exit_reason = "hasMore=1 but lastSeenAssetId null"
+                break
+            if last_seen_id == prev_last_seen_id:
+                logger.warning(
+                    f"CSAM page {page}: cursor stalled at "
+                    f"lastSeenAssetId={last_seen_id} for two consecutive "
+                    f"pages — aborting to avoid infinite loop. Likely "
+                    f"a server-side issue."
+                )
+                exit_reason = "cursor stalled (no advance)"
+                break
+            prev_last_seen_id = last_seen_id
+
+        else:
+            # `while ... else` runs when the loop exits via the
+            # `while page < max_pages:` condition itself (i.e. we hit
+            # the safety cap). This is a defensive exit — log loudly.
+            exit_reason = f"hit max_pages safety cap ({max_pages})"
+            logger.warning(
+                f"CSAM pull stopped at safety cap {max_pages:,} pages "
+                f"({len(all_assets):,} assets) — pagination did not "
+                f"reach hasMore=0. If this is a real fleet of this "
+                f"size, raise `max_pages` in fetch_csam_assets()."
+            )
 
         if expected is not None and len(all_assets) != expected:
             logger.warning(
                 f"CSAM assets: fetched {len(all_assets):,} but count endpoint "
                 f"reported {expected:,} (drift of {len(all_assets) - expected:+,})"
             )
-        logger.info(f"Fetched {len(all_assets)} CSAM assets total")
+
+        # Final summary line — operators / log scrapers key on this.
+        # Format chosen to match acceptance §5.6: "CSAM pull complete:
+        # N assets across P pages (hasMore=0)".
+        if exit_reason == "hasMore=0":
+            logger.info(
+                f"CSAM pull complete: {len(all_assets):,} assets across "
+                f"{page} pages (hasMore=0)"
+            )
+        else:
+            logger.warning(
+                f"CSAM pull stopped early: {len(all_assets):,} assets "
+                f"across {page} pages — exit reason: {exit_reason}"
+            )
         return all_assets
 
     # ── Tag Extraction Helpers ───────────────────────────────────

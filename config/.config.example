@@ -33,9 +33,12 @@ max_retries = 3
 # Pull VM (hosts+detections) and CSAM in parallel. ~40-50% faster wall-clock.
 # Set to false if your tenant's rate limits trip 429s under parallel load.
 parallel_refresh = true
-# CSAM page size (max 1000). Larger = fewer API calls but bigger responses.
-# At 104k assets: 1000→104 calls, 300→347 calls.
-csam_page_size = 1000
+# CSAM page size. Documented max is 1000 but Qualys silently clamps to ~100
+# on some tenants — when that happens with our old default of 1000, a 500-page
+# loop ceiling produces a hard 50,000-asset cap regardless of true fleet size.
+# 300 is the value Qualys's own QualysETL reference implementation uses and
+# appears to be honoured without clamping. See docs/CSAM_PAGINATION.md.
+csam_page_size = 300
 # Only pull CSAM assets seen in the last N days (server-side QQL filter on
 # 'lastCheckedIn'). Dramatically cuts API volume for big tenants. Set to 0
 # to disable the filter and pull everything.
