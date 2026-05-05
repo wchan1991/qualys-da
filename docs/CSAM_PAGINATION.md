@@ -84,8 +84,19 @@ These are the defensive exits, in priority order:
 |---|---|
 | `hasMoreRecords` field missing entirely | Treat as 0, log `WARNING: response missing hasMoreRecords field — treating as completion`, exit |
 | `hasMoreRecords == 1` and `lastSeenAssetId` is null/empty | Log `WARNING: hasMore=1 but lastSeenAssetId is null — invalid cursor, aborting`, exit |
-| `lastSeenAssetId` repeats from previous page | Log `WARNING: cursor stalled at lastSeenAssetId=X for two consecutive pages — aborting`, exit |
+| `lastSeenAssetId` repeats from previous page **AND page returned 0 assets** | Real stall. Log `WARNING: cursor stalled ... AND page returned 0 assets — real stall, aborting`, exit |
+| `lastSeenAssetId` repeats from previous page but **page has new assets** | Cosmetic cursor — server pages internally regardless of `startFromId`. Log a one-shot `WARNING: CSAM cursor field appears cosmetic on this tenant`, then trust `hasMoreRecords` for termination and **keep paginating**. |
 | `max_pages` safety cap hit (default 10 000) | Log `WARNING: CSAM pull stopped at safety cap N pages — pagination did not reach hasMore=0`, exit |
+
+**The cosmetic-cursor case matters.** On some Qualys tenants the
+server uses an internal cursor that advances regardless of the
+`startFromId` we send, and `lastSeenAssetId` in the response is
+informational only. Pre-2026-05-04 50 000-asset pulls relied on
+exactly this: the loop just kept calling and the server kept serving
+new pages. A strict "cursor must advance" check broke those pulls
+until 2026-05-05; the current logic detects the cosmetic-cursor
+pattern (cursor stuck + new assets each page) and trusts
+`hasMoreRecords` instead.
 
 The safety cap is a runaway guard, not a normal limit. At default
 10 000 pages × 300 assets per page that's ~3 M assets — far above
@@ -169,18 +180,24 @@ checkpoint; the next refresh:
 
 ## Page size
 
-Default is **300 assets per page** (`csam_page_size = 300` in
-`config/.config`). Qualys's API documentation says the maximum is
-1000, but on observed tenants any value above ~300 is silently clamped
-to ~100. The clamping was the root of a 50 000-asset hard cap that bit
-production until 2026-05-04: with `max_pages=500` × clamped 100/page,
-every pull terminated at exactly 50 000 regardless of true fleet size.
+Default is **1000 assets per page** (`csam_page_size = 1000` in
+`config/.config`). Qualys's API documentation says the maximum is 1000.
 
-300 is the value Qualys's own [QualysETL][1] reference implementation
-uses and appears to be honoured without clamping. Bumping it higher
-gives diminishing returns once Qualys's per-window asset throughput cap
-(~40 000 assets per rate-limit window) kicks in — see
-[`CSAM_RATE_LIMIT.md`](CSAM_RATE_LIMIT.md).
+A subtlety we hit on 2026-05-05: on production tenants Qualys clamps
+the actual response to ~100 assets per page regardless of the value
+you send for `limitResults`, BUT the cursor advancement (i.e. how
+`lastSeenAssetId` is calculated) **depends on the requested value, not
+the served size**. We briefly tried `csam_page_size = 300` (the value
+Qualys's own [QualysETL][1] reference uses) and observed the cursor
+stalling at the same `lastSeenAssetId` across consecutive pages, capping
+pulls at ~200 unique assets. With `limitResults=1000` the cursor
+advances normally and yields 50,000+ unique assets per query.
+
+Stick with 1000 unless you've verified empirically that a different
+value advances the cursor on your tenant. The defensive cursor-stall
+logic in `fetch_csam_assets` will WARN if you pick a value that breaks
+the cursor — look for `cursor stalled at lastSeenAssetId=X` in
+`logs/app.log`.
 
 ## Resume across runs
 

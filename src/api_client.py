@@ -962,8 +962,12 @@ class QualysClient:
             termination is `hasMoreRecords == 0`.
         expected  : total from count_csam_assets() for progress / drift logging.
         page_size : assets per request. Defaults to config.csam_page_size
-            (default 300 — Qualys's QualysETL reference uses this; higher
-            values appear to be silently clamped on some tenants).
+            (default 1000). Qualys clamps the actual response to ~100 on
+            most tenants but the cursor advancement depends on the
+            REQUESTED value, not the served size — values < 1000 have
+            been observed to stall the cursor on production tenants
+            (same lastSeenAssetId returned on consecutive pages, capping
+            pulls at ~200 unique assets). Stick with 1000.
         lookback_days : if > 0, server-side filter restricts to assets whose
             `lastCheckedIn` is within the last N days. 0 / None = no filter.
             If Qualys rejects the filter on the first page, we log a warning
@@ -987,10 +991,12 @@ class QualysClient:
         for every page we successfully consumed, so the checkpoint is current.
         """
         if page_size is None:
-            page_size = getattr(self.config, "csam_page_size", 300)
-        # Qualys CSAM search accepts up to 1000 documented but appears to
-        # silently clamp larger values on some tenants — 300 is the value
-        # Qualys's own QualysETL reference uses.
+            page_size = getattr(self.config, "csam_page_size", 1000)
+        # Documented max is 1000. Empirically: smaller requested values
+        # (e.g. 300) cause cursor stalling on some tenants — the response
+        # is still clamped to ~100 assets, but the lastSeenAssetId field
+        # stops advancing across consecutive pages, capping pulls at ~200.
+        # 1000 keeps the cursor advancing normally.
         page_size = max(1, min(int(page_size), 1000))
 
         # Resolve lookback: explicit arg wins, otherwise config default.
@@ -1255,14 +1261,43 @@ class QualysClient:
                 exit_reason = "hasMore=1 but lastSeenAssetId null"
                 break
             if last_seen_id == prev_last_seen_id:
-                logger.warning(
-                    f"CSAM page {page}: cursor stalled at "
-                    f"lastSeenAssetId={last_seen_id} for two consecutive "
-                    f"pages — aborting to avoid infinite loop. Likely "
-                    f"a server-side issue."
-                )
-                exit_reason = "cursor stalled (no advance)"
-                break
+                # Cursor field didn't advance. Two scenarios:
+                #
+                # (a) Real stall: server returned same cursor AND no
+                #     new assets. Loop would spin forever — abort.
+                #
+                # (b) Cosmetic cursor: server returned same cursor but
+                #     DIFFERENT new assets. Common on tenants where
+                #     `lastSeenAssetId` is informational and Qualys
+                #     pages internally regardless of what we send for
+                #     `startFromId`. Trust `hasMoreRecords` for
+                #     termination instead and keep paginating.
+                #
+                # The 50,000-asset working pulls in pre-2026-05-04 logs
+                # were riding (b) — the OLD code didn't check the
+                # cursor at all and rode the internal cursor through
+                # 500 pages of 100 unique assets each. Adding a strict
+                # cursor-must-advance check broke those pulls. The
+                # max_pages safety cap (default 10000) bounds runaway
+                # loops in case both the cursor AND the data stall.
+                if not assets:
+                    logger.warning(
+                        f"CSAM page {page}: cursor stalled at "
+                        f"lastSeenAssetId={last_seen_id} AND page "
+                        f"returned 0 assets — real stall, aborting."
+                    )
+                    exit_reason = "cursor stalled (no advance, no data)"
+                    break
+                if not getattr(self, "_csam_cosmetic_cursor_warned", False):
+                    logger.warning(
+                        f"CSAM cursor field appears cosmetic on this "
+                        f"tenant: lastSeenAssetId={last_seen_id} did "
+                        f"not advance between pages but page returned "
+                        f"{len(assets)} new assets. Trusting "
+                        f"hasMoreRecords for termination instead. "
+                        f"(Logged once per process.)"
+                    )
+                    self._csam_cosmetic_cursor_warned = True
             prev_last_seen_id = last_seen_id
 
         else:

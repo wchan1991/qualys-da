@@ -165,19 +165,33 @@ class CursorTerminationTest(unittest.TestCase):
 
 
 class CursorStallTest(unittest.TestCase):
-    """If the server returns the same `lastSeenAssetId` two pages in
-    a row with `hasMore=1`, abort to avoid spinning forever."""
+    """`lastSeenAssetId` not advancing across consecutive pages can mean
+    one of two things; we treat them differently:
 
-    def test_cursor_stall_aborts_with_warning(self):
+    * **Real stall** — same cursor AND empty page. Server is genuinely
+      stuck. Abort with WARNING.
+    * **Cosmetic cursor** — same cursor but page returned new assets.
+      Common on tenants where Qualys uses an internal cursor and
+      `lastSeenAssetId` is informational. Trust `hasMoreRecords` for
+      termination and keep paginating. WARN once per process so the
+      operator sees it.
+
+    History: an earlier version of this test asserted abort-on-stall
+    when the page had assets. That broke pulls on tenants where the
+    cursor is cosmetic — `b558917` era 50,000-asset pulls relied on
+    riding the internal cursor through 500 pages with no `lastSeenAssetId`
+    advance. See BACKLOG entry 2026-05-05.
+    """
+
+    def test_real_stall_aborts(self):
+        """Cursor stuck AND page empty → real stall, abort."""
         client = _make_client()
-        # Page 1: cursor=a5, hasMore=1.  Page 2: same cursor, hasMore=1.
-        # Loop should abort after page 2 with a warning.
         client._csam_request = MagicMock(side_effect=[
             _fake_response(
                 assets=[{"assetId": "a5"}], has_more=1, last_seen_id="a5",
             ),
-            _fake_response(
-                assets=[{"assetId": "a6"}], has_more=1, last_seen_id="a5",
+            _fake_response(  # cursor stuck + empty page = real stall
+                assets=[], has_more=1, last_seen_id="a5",
             ),
             _fake_response(  # would-be page 3 — should not be reached
                 assets=[{"assetId": "a7"}], has_more=0, last_seen_id="a7",
@@ -185,11 +199,47 @@ class CursorStallTest(unittest.TestCase):
         ])
         with self.assertLogs("src.api_client", level="WARNING") as cm:
             assets = client.fetch_csam_assets()
-        # Pages 1 and 2 consumed; loop aborted before page 3.
         self.assertEqual(client._csam_request.call_count, 2)
-        self.assertEqual(len(assets), 2)
+        self.assertEqual(len(assets), 1)  # only page 1's asset
         joined = "\n".join(cm.output)
-        self.assertIn("cursor stalled", joined.lower())
+        self.assertIn("real stall", joined.lower())
+
+    def test_cosmetic_cursor_keeps_paginating(self):
+        """Cursor stuck but pages return DIFFERENT new assets → keep
+        going. This is the b558917-era working-pull pattern Qualys uses
+        on the operator's tenant. The loop should run all 4 mocked
+        pages, not abort at page 2. One-shot WARNING about the cosmetic
+        cursor must appear so the operator sees it."""
+        client = _make_client()
+        # All 4 responses share lastSeenAssetId='a5' (cursor doesn't
+        # advance) but return distinct assets each time. Final response
+        # has hasMore=0 to terminate cleanly.
+        client._csam_request = MagicMock(side_effect=[
+            _fake_response(
+                assets=[{"assetId": "a1"}], has_more=1, last_seen_id="a5",
+            ),
+            _fake_response(
+                assets=[{"assetId": "a2"}], has_more=1, last_seen_id="a5",
+            ),
+            _fake_response(
+                assets=[{"assetId": "a3"}], has_more=1, last_seen_id="a5",
+            ),
+            _fake_response(
+                assets=[{"assetId": "a4"}], has_more=0, last_seen_id="a5",
+            ),
+        ])
+        with self.assertLogs("src.api_client", level="WARNING") as cm:
+            assets = client.fetch_csam_assets()
+        # All 4 pages consumed — NOT aborted at page 2 like the old behaviour
+        self.assertEqual(client._csam_request.call_count, 4)
+        self.assertEqual(len(assets), 4)
+        # Cosmetic-cursor warning fires once
+        cosmetic_warns = [m for m in cm.output if "cosmetic" in m.lower()]
+        self.assertEqual(len(cosmetic_warns), 1,
+            f"Cosmetic-cursor warning should fire exactly once, got: {cm.output}")
+        # Loop terminated via hasMore=0, not stall
+        for m in cm.output:
+            self.assertNotIn("real stall", m.lower())
 
 
 class DefensiveResponseTest(unittest.TestCase):
